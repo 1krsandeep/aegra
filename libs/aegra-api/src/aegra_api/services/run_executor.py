@@ -138,9 +138,9 @@ async def execute_run(job: RunJob) -> None:
         _timeout_cancellations.discard(run_id)
         active_runs.pop(run_id, None)
         if not resumes_elsewhere:
-            await _best_effort_flush(run_id)
             await streaming_service.cleanup_run(run_id)
             await _signal_run_done(run_id)
+            await _best_effort_flush(run_id)
 
 
 # ------------------------------------------------------------------
@@ -149,11 +149,15 @@ async def execute_run(job: RunJob) -> None:
 
 
 async def _best_effort_flush(run_id: str) -> None:
-    """Flush OTEL spans to exporters without blocking cleanup on failure."""
+    """Flush OTEL after cleanup and completion signaling without disrupting either."""
     try:
-        await asyncio.to_thread(flush_otel_spans)
-    except BaseException:
-        logger.warning("OTEL span flush failed (best-effort)", run_id=run_id)
+        flushed = await asyncio.to_thread(flush_otel_spans)
+        if not flushed:
+            logger.warning("OTEL span flush incomplete (some spans may be lost)", run_id=run_id)
+    except asyncio.CancelledError:
+        logger.warning("OTEL span flush cancelled (best-effort)", run_id=run_id)
+    except Exception:
+        logger.warning("OTEL span flush failed (best-effort)", run_id=run_id, exc_info=True)
 
 
 async def _best_effort_signal(fn: Any, *args: Any) -> None:

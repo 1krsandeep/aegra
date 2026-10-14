@@ -341,13 +341,14 @@ class TestOtelFlushOnRunCompletion:
 
     @pytest.mark.asyncio
     async def test_flush_called_on_success(self) -> None:
-        """force_flush is offloaded to a thread after a successful run."""
         mock_graph = MagicMock()
         mock_graph.__aenter__ = AsyncMock(return_value=mock_graph)
         mock_graph.__aexit__ = AsyncMock(return_value=False)
 
         mock_service = MagicMock()
         mock_service.get_graph = MagicMock(return_value=mock_graph)
+
+        call_order: list[str] = []
 
         with (
             patch("aegra_api.services.run_executor.get_langgraph_service", return_value=mock_service),
@@ -356,7 +357,7 @@ class TestOtelFlushOnRunCompletion:
             patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
             patch("aegra_api.services.run_executor.stream_graph_events", return_value=_empty_async_gen()),
             patch("aegra_api.services.run_executor._signal_end_event", new_callable=AsyncMock),
-            patch("aegra_api.services.run_executor._signal_run_done", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor._signal_run_done", new_callable=AsyncMock) as mock_signal_done,
             patch("aegra_api.services.run_executor.with_auth_ctx") as mock_auth,
             patch("aegra_api.services.run_executor.flush_otel_spans") as mock_flush,
         ):
@@ -364,15 +365,16 @@ class TestOtelFlushOnRunCompletion:
             mock_auth_ctx.__aenter__ = AsyncMock(return_value=None)
             mock_auth_ctx.__aexit__ = AsyncMock(return_value=False)
             mock_auth.return_value = mock_auth_ctx
-            mock_streaming.cleanup_run = AsyncMock()
+            mock_streaming.cleanup_run = AsyncMock(side_effect=lambda *a: call_order.append("cleanup_run"))
+            mock_signal_done.side_effect = lambda *a: call_order.append("signal_run_done")
+            mock_flush.side_effect = lambda *a, **kw: call_order.append("flush")
 
             await execute_run(_make_job())
 
-        mock_flush.assert_called_once()
+        assert call_order == ["cleanup_run", "signal_run_done", "flush"]
 
     @pytest.mark.asyncio
     async def test_flush_called_on_error(self) -> None:
-        """force_flush is offloaded to a thread even when the run errors."""
         with (
             patch("aegra_api.services.run_executor.start_run", new_callable=AsyncMock, return_value=True),
             patch("aegra_api.services.run_executor.finalize_run", new_callable=AsyncMock, return_value=True),
@@ -394,7 +396,6 @@ class TestOtelFlushOnRunCompletion:
 
     @pytest.mark.asyncio
     async def test_flush_called_on_user_cancellation(self) -> None:
-        """force_flush is called when a run is cancelled by the user."""
         with (
             patch("aegra_api.services.run_executor.start_run", new_callable=AsyncMock, return_value=True),
             patch("aegra_api.services.run_executor.finalize_run", new_callable=AsyncMock, return_value=True),
@@ -417,7 +418,6 @@ class TestOtelFlushOnRunCompletion:
 
     @pytest.mark.asyncio
     async def test_flush_skipped_on_lease_loss(self) -> None:
-        """force_flush must NOT run on lease-loss — another worker owns the run."""
         with (
             patch("aegra_api.services.run_executor.start_run", new_callable=AsyncMock, return_value=True),
             patch("aegra_api.services.run_executor.finalize_run", new_callable=AsyncMock, return_value=True),
@@ -444,7 +444,6 @@ class TestOtelFlushOnRunCompletion:
 
     @pytest.mark.asyncio
     async def test_flush_skipped_on_shutdown_drain(self) -> None:
-        """force_flush must NOT run on shutdown drain — the run is requeued."""
         with (
             patch("aegra_api.services.run_executor.start_run", new_callable=AsyncMock, return_value=True),
             patch("aegra_api.services.run_executor.finalize_run", new_callable=AsyncMock),
@@ -468,6 +467,91 @@ class TestOtelFlushOnRunCompletion:
                 _shutdown_cancellations.discard("run-1")
 
         mock_flush.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_flush_failure_does_not_block_cleanup(self) -> None:
+        with (
+            patch("aegra_api.services.run_executor.start_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.services.run_executor.finalize_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._signal_end_event", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor._signal_run_done", new_callable=AsyncMock) as mock_signal_done,
+            patch(
+                "aegra_api.services.run_executor._stream_graph",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("graph exploded"),
+            ),
+            patch("aegra_api.services.run_executor.flush_otel_spans", side_effect=OSError("exporter down")),
+        ):
+            mock_streaming.signal_run_error = AsyncMock()
+            mock_streaming.cleanup_run = AsyncMock()
+
+            await execute_run(_make_job())
+
+        mock_streaming.cleanup_run.assert_awaited_once_with("run-1")
+        mock_signal_done.assert_awaited_once_with("run-1")
+
+    @pytest.mark.asyncio
+    async def test_flush_cancellation_does_not_block_cleanup(self) -> None:
+        with (
+            patch("aegra_api.services.run_executor.start_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.services.run_executor.finalize_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._signal_end_event", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor._signal_run_done", new_callable=AsyncMock) as mock_signal_done,
+            patch(
+                "aegra_api.services.run_executor._stream_graph",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("graph exploded"),
+            ),
+            patch(
+                "aegra_api.services.run_executor.flush_otel_spans",
+                side_effect=asyncio.CancelledError,
+            ),
+        ):
+            mock_streaming.signal_run_error = AsyncMock()
+            mock_streaming.cleanup_run = AsyncMock()
+
+            await execute_run(_make_job())
+
+        mock_streaming.cleanup_run.assert_awaited_once_with("run-1")
+        mock_signal_done.assert_awaited_once_with("run-1")
+
+    @pytest.mark.asyncio
+    async def test_incomplete_flush_logs_warning_with_run_id(self) -> None:
+        mock_graph = MagicMock()
+        mock_graph.__aenter__ = AsyncMock(return_value=mock_graph)
+        mock_graph.__aexit__ = AsyncMock(return_value=False)
+
+        mock_service = MagicMock()
+        mock_service.get_graph = MagicMock(return_value=mock_graph)
+
+        with (
+            patch("aegra_api.services.run_executor.get_langgraph_service", return_value=mock_service),
+            patch("aegra_api.services.run_executor.start_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.services.run_executor.finalize_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor.stream_graph_events", return_value=_empty_async_gen()),
+            patch("aegra_api.services.run_executor._signal_end_event", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor._signal_run_done", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor.with_auth_ctx") as mock_auth,
+            patch("aegra_api.services.run_executor.flush_otel_spans", return_value=False),
+            patch("aegra_api.services.run_executor.logger") as mock_logger,
+        ):
+            mock_auth_ctx = AsyncMock()
+            mock_auth_ctx.__aenter__ = AsyncMock(return_value=None)
+            mock_auth_ctx.__aexit__ = AsyncMock(return_value=False)
+            mock_auth.return_value = mock_auth_ctx
+            mock_streaming.cleanup_run = AsyncMock()
+
+            await execute_run(_make_job())
+
+        incomplete_calls = [
+            c for c in mock_logger.warning.call_args_list
+            if "incomplete" in str(c)
+        ]
+        assert len(incomplete_calls) == 1
+        assert incomplete_calls[0].kwargs["run_id"] == "run-1"
 
 
 class TestLeaseLossCancellation:
