@@ -546,10 +546,7 @@ class TestOtelFlushOnRunCompletion:
 
             await execute_run(_make_job())
 
-        incomplete_calls = [
-            c for c in mock_logger.warning.call_args_list
-            if "incomplete" in str(c)
-        ]
+        incomplete_calls = [c for c in mock_logger.warning.call_args_list if "incomplete" in str(c)]
         assert len(incomplete_calls) == 1
         assert incomplete_calls[0].kwargs["run_id"] == "run-1"
 
