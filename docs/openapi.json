@@ -2342,11 +2342,11 @@
                 "interrupt"
               ],
               "type": "string",
-              "description": "Cancellation strategy: 'cancel' for hard cancel, 'interrupt' for cooperative interrupt.",
+              "description": "Accepted for compatibility: 'cancel' and 'interrupt' both stop the run immediately and finalize it as interrupted.",
               "default": "cancel",
               "title": "Action"
             },
-            "description": "Cancellation strategy: 'cancel' for hard cancel, 'interrupt' for cooperative interrupt."
+            "description": "Accepted for compatibility: 'cancel' and 'interrupt' both stop the run immediately and finalize it as interrupted."
           }
         ],
         "responses": {
@@ -2402,11 +2402,11 @@
                 "interrupt"
               ],
               "type": "string",
-              "description": "Cancellation strategy: 'cancel' for hard cancel, 'interrupt' for cooperative interrupt.",
+              "description": "Accepted for compatibility: 'cancel' and 'interrupt' both stop the run immediately and finalize it as interrupted.",
               "default": "interrupt",
               "title": "Action"
             },
-            "description": "Cancellation strategy: 'cancel' for hard cancel, 'interrupt' for cooperative interrupt."
+            "description": "Accepted for compatibility: 'cancel' and 'interrupt' both stop the run immediately and finalize it as interrupted."
           }
         ],
         "requestBody": {
