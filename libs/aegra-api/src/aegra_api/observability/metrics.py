@@ -6,12 +6,14 @@ Python runtime metrics in Prometheus text, or JSON when ``format=json``.
 """
 
 import math
+import os
 from typing import Any, Literal
 
 import prometheus_client
 import structlog
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, Response
+from prometheus_client.multiprocess import MultiProcessCollector
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from aegra_api.settings import settings
@@ -80,15 +82,25 @@ def registry_to_json(registry: prometheus_client.CollectorRegistry) -> dict[str,
     return families
 
 
+def _scrape_registry(registry: prometheus_client.CollectorRegistry) -> prometheus_client.CollectorRegistry:
+    # Multiprocess values live in mmap files. expose() scraped a fresh registry each time.
+    if "PROMETHEUS_MULTIPROC_DIR" not in os.environ:
+        return registry
+    ephemeral = prometheus_client.CollectorRegistry()
+    MultiProcessCollector(ephemeral)
+    return ephemeral
+
+
 def _add_metrics_route(app: FastAPI, registry: prometheus_client.CollectorRegistry) -> None:
     @app.get("/metrics", include_in_schema=False)
     def metrics(
         output_format: Literal["prometheus", "json"] = Query(default="prometheus", alias="format"),
     ) -> Response:
+        scrape_registry = _scrape_registry(registry)
         if output_format == "json":
-            return JSONResponse(registry_to_json(registry))
+            return JSONResponse(registry_to_json(scrape_registry))
         return Response(
-            prometheus_client.generate_latest(registry),
+            prometheus_client.generate_latest(scrape_registry),
             media_type=prometheus_client.CONTENT_TYPE_LATEST,
         )
 

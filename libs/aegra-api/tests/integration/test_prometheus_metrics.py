@@ -1,5 +1,7 @@
 """Integration tests for the Prometheus /metrics endpoint."""
 
+from pathlib import Path
+
 import prometheus_client
 import pytest
 from fastapi import APIRouter, FastAPI
@@ -223,6 +225,49 @@ def test_metrics_json_format_coerces_non_finite_values(
         if sample["name"] == "aegra_test_nonfinite_http"
     }
     assert samples == {"nan": None, "inf": None}
+
+
+def test_multiproc_dir_scrapes_a_fresh_registry_for_both_formats(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_registry: prometheus_client.CollectorRegistry,
+    tmp_path: Path,
+) -> None:
+    """PROMETHEUS_MULTIPROC_DIR replaces the supplied registry on every scrape."""
+    gauge = prometheus_client.Gauge(
+        "aegra_test_supplied_only",
+        "present only on the supplied registry",
+        registry=fresh_registry,
+    )
+    gauge.set(7)
+
+    registries: list[prometheus_client.CollectorRegistry] = []
+    real_init = prometheus_client.multiprocess.MultiProcessCollector.__init__
+
+    def _tracking(
+        self: prometheus_client.multiprocess.MultiProcessCollector,
+        registry: prometheus_client.CollectorRegistry,
+        path: str | None = None,
+    ) -> None:
+        registries.append(registry)
+        real_init(self, registry, path)
+
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    monkeypatch.setattr(prometheus_client.multiprocess.MultiProcessCollector, "__init__", _tracking)
+
+    app = _make_app(monkeypatch, fresh_registry)
+    client = TestClient(app)
+
+    text = client.get("/metrics")
+    assert text.status_code == 200
+    assert "aegra_test_supplied_only" not in text.text
+
+    body = client.get("/metrics", params={"format": "json"})
+    assert body.status_code == 200
+    assert "aegra_test_supplied_only" not in body.json()
+
+    assert len(registries) == 2
+    assert registries[0] is not registries[1]
+    assert fresh_registry not in registries
 
 
 def test_metrics_rejects_unknown_format(
