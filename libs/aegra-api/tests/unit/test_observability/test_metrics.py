@@ -139,3 +139,23 @@ def test_registry_to_json_coerces_non_finite_samples(
     assert samples["nan"] is None
     assert samples["inf"] is None
     assert samples["ok"] == 1.5
+
+
+def test_registry_to_json_uses_info_exposition_name(
+    fresh_registry: prometheus_client.CollectorRegistry,
+) -> None:
+    """Info families keep the _info suffix Prometheus writes in text."""
+    info = prometheus_client.Info(
+        "aegra_test_build",
+        "build information",
+        registry=fresh_registry,
+    )
+    info.info({"version": "1"})
+
+    body = registry_to_json(fresh_registry)
+    assert "aegra_test_build_info" in body
+    assert body["aegra_test_build_info"]["type"] == "info"
+    samples = body["aegra_test_build_info"]["samples"]
+    assert samples[0]["name"] == "aegra_test_build_info"
+    assert samples[0]["labels"] == {"version": "1"}
+    assert samples[0]["value"] == 1.0
