@@ -148,6 +148,57 @@ def test_metrics_json_format_returns_same_http_families(
     assert set(sample) >= {"name", "labels", "value"}
 
 
+def test_metrics_json_preserves_counter_and_histogram_samples(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_registry: prometheus_client.CollectorRegistry,
+) -> None:
+    """JSON keeps every sample name, label, and value for counters and histograms."""
+    counter = prometheus_client.Counter(
+        "aegra_test_requests",
+        "requests",
+        ["method"],
+        registry=fresh_registry,
+    )
+    counter.labels(method="GET").inc(3)
+
+    histogram = prometheus_client.Histogram(
+        "aegra_test_latency",
+        "latency",
+        ["route"],
+        registry=fresh_registry,
+        buckets=(0.1, 0.5, 1.0),
+    )
+    histogram.labels(route="/hello").observe(0.3)
+
+    app = _make_app(monkeypatch, fresh_registry)
+    response = TestClient(app).get("/metrics", params={"format": "json"})
+    assert response.status_code == 200
+    body = response.json()
+
+    counter_samples = body["aegra_test_requests_total"]["samples"]
+    assert [sample for sample in counter_samples if sample["name"] == "aegra_test_requests_total"] == [
+        {"name": "aegra_test_requests_total", "labels": {"method": "GET"}, "value": 3.0}
+    ]
+    created = [sample for sample in counter_samples if sample["name"] == "aegra_test_requests_created"]
+    assert len(counter_samples) == 2
+    assert created[0]["labels"] == {"method": "GET"}
+    assert isinstance(created[0]["value"], float)
+
+    histogram_samples = body["aegra_test_latency"]["samples"]
+    assert [sample for sample in histogram_samples if not sample["name"].endswith("_created")] == [
+        {"name": "aegra_test_latency_bucket", "labels": {"route": "/hello", "le": "0.1"}, "value": 0.0},
+        {"name": "aegra_test_latency_bucket", "labels": {"route": "/hello", "le": "0.5"}, "value": 1.0},
+        {"name": "aegra_test_latency_bucket", "labels": {"route": "/hello", "le": "1.0"}, "value": 1.0},
+        {"name": "aegra_test_latency_bucket", "labels": {"route": "/hello", "le": "+Inf"}, "value": 1.0},
+        {"name": "aegra_test_latency_count", "labels": {"route": "/hello"}, "value": 1.0},
+        {"name": "aegra_test_latency_sum", "labels": {"route": "/hello"}, "value": 0.3},
+    ]
+    histogram_created = [sample for sample in histogram_samples if sample["name"] == "aegra_test_latency_created"]
+    assert len(histogram_samples) == 7
+    assert histogram_created[0]["labels"] == {"route": "/hello"}
+    assert isinstance(histogram_created[0]["value"], float)
+
+
 def test_metrics_json_format_coerces_non_finite_values(
     monkeypatch: pytest.MonkeyPatch,
     fresh_registry: prometheus_client.CollectorRegistry,
