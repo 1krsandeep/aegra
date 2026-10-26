@@ -83,7 +83,7 @@ def registry_to_json(registry: prometheus_client.CollectorRegistry) -> dict[str,
 
 
 def _scrape_registry(registry: prometheus_client.CollectorRegistry) -> prometheus_client.CollectorRegistry:
-    # Multiprocess values live in mmap files. expose() scraped a fresh registry each time.
+    # Multiprocess values live in mmap files, so each scrape needs a fresh collector.
     if "PROMETHEUS_MULTIPROC_DIR" not in os.environ:
         return registry
     ephemeral = prometheus_client.CollectorRegistry()
