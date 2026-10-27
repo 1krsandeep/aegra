@@ -37,6 +37,7 @@ from aegra_api.services.responses_mapping import (
     project_conversation_items,
     project_response,
     public_thread_metadata,
+    retains_stateless_thread,
     threads_conflict,
 )
 from aegra_api.services.responses_stream import iter_responses_sse
@@ -71,6 +72,7 @@ class StartedRun:
     thread_id: str
     user_id: str
     cancel_on_disconnect: bool
+    message_offset: int
 
 
 async def load_owned_run(session: AsyncSession, run_id: str, user_id: str) -> RunORM | None:
@@ -130,7 +132,9 @@ async def execute_response(session: AsyncSession, user: User, body: ResponseCrea
     resume = bind_resume(turn.interrupt_id, turn.resume, pending) if turn.interrupt_id else turn.resume
     request = _run_create(body, turn, resume=resume)
     await _apply_create_run_auth(user, resolved.thread_id, request)
+    message_offset = 0 if resolved.minted else await _message_offset(resolved.thread_id, user)
     meta = build_responses_meta(body, conversation_id=conversation_id_of(body.conversation))
+    meta["message_offset"] = message_offset
     run_id, run_model, _job = await _prepare_run(
         session,
         resolved.thread_id,
@@ -152,34 +156,44 @@ async def execute_response(session: AsyncSession, user: User, body: ResponseCrea
             thread_id=resolved.thread_id,
             user_id=user.identity,
             cancel_on_disconnect=not body.background,
+            message_offset=message_offset,
         )
     if body.background:
         return payload
 
+    fresh: RunORM | None = None
     try:
         try:
             await executor.wait_for_completion(run_id, timeout=float(settings.worker.BG_JOB_TIMEOUT_SECS))
         except TimeoutError:
             logger.warning("responses wait timed out", run_id=run_id)
             await streaming_service.cancel_run(run_id)
+            fresh = await _reload_run(run_id, user.identity)
             return await _timeout_payload(run_id, user.identity)
         fresh = await _reload_run(run_id, user.identity)
         if fresh is None:
             raise HTTPException(404, f"Response '{run_id}' not found")
         return project_run(fresh)
     finally:
-        if resolved.ephemeral:
+        if resolved.ephemeral and not _retains_run(fresh):
             await asyncio.shield(delete_thread_by_id(resolved.thread_id, user.identity))
 
 
 async def iter_response_sse(started: StartedRun, *, starting_after: str | None) -> AsyncGenerator[str, None]:
     """Follow a started run and delete a stateless thread when the stream ends."""
     try:
-        async for frame in iter_responses_sse(started.run, started.payload, starting_after=starting_after):
+        async for frame in iter_responses_sse(
+            started.run,
+            started.payload,
+            starting_after=starting_after,
+            message_offset=started.message_offset,
+        ):
             yield frame
     finally:
         if started.ephemeral:
-            await asyncio.shield(delete_thread_by_id(started.thread_id, started.user_id))
+            fresh = await _reload_run(started.run.run_id, started.user_id)
+            if not _retains_run(fresh):
+                await asyncio.shield(delete_thread_by_id(started.thread_id, started.user_id))
 
 
 async def resolve_thread(session: AsyncSession, user: User, body: ResponseCreate) -> ResolvedThread:
@@ -349,6 +363,28 @@ def _run_create(body: ResponseCreate, turn: PreparedTurn, *, resume: Any) -> Run
         input=turn.messages,
         stream_mode=_RESPONSE_STREAM_MODES,
     )
+
+
+def _retains_run(run: RunORM | None) -> bool:
+    if run is None:
+        return False
+    output = run.output if isinstance(run.output, dict) else None
+    return retains_stateless_thread(run.status, output)
+
+
+async def _message_offset(thread_id: str, user: User) -> int:
+    """How many checkpoint messages already exist, so this run's output can skip them."""
+    try:
+        state = await get_thread_state(thread_id, False, None, user)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return 0
+        raise
+    values = state.values if isinstance(state.values, dict) else {}
+    messages = values.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    return len(messages)
 
 
 async def pending_interrupt_ids(session: AsyncSession, thread_id: str, user_id: str) -> list[str]:

@@ -26,7 +26,6 @@ from aegra_api.core.auth_handlers import build_auth_context, handle_event
 from aegra_api.core.orm import get_session
 from aegra_api.core.sse import get_sse_headers, make_sse_response, sse_to_bytes
 from aegra_api.models import Run, User
-from aegra_api.models.errors import SSE_RESPONSE
 from aegra_api.models.responses import (
     ConversationCreate,
     ConversationDeleted,
@@ -39,6 +38,7 @@ from aegra_api.models.responses import (
     openai_error_body,
 )
 from aegra_api.services.broker import broker_manager
+from aegra_api.services.responses_mapping import meta_from_params
 from aegra_api.services.responses_service import (
     StartedRun,
     create_conversation,
@@ -82,9 +82,21 @@ router = APIRouter(
     dependencies=auth_dependency,
     responses={
         422: {"model": OpenAIErrorResponse, "description": "The request was rejected."},
-        404: {"model": OpenAIErrorResponse, "description": "The response or conversation was not found."},
     },
 )
+
+_NOT_FOUND = {
+    404: {
+        "model": OpenAIErrorResponse,
+        "description": "The response, conversation, or assistant was not found.",
+    }
+}
+_STREAM_OR_JSON = {
+    200: {
+        "description": "The response object, or a Server-Sent Events stream when stream is true.",
+        "content": {"text/event-stream": {"schema": {"type": "string"}}},
+    }
+}
 
 
 def _http_message(detail: Any) -> str:
@@ -112,7 +124,9 @@ def _cancel_on_disconnect(run_id: str) -> Callable[[MutableMapping[str, Any]], A
     return _cancel
 
 
-@router.post("/responses", response_model=ResponseResource, tags=["Responses"], responses={**SSE_RESPONSE})
+@router.post(
+    "/responses", response_model=ResponseResource, tags=["Responses"], responses={**_STREAM_OR_JSON, **_NOT_FOUND}
+)
 async def create_response(
     body: ResponseCreate,
     user: User = Depends(get_current_user),
@@ -130,7 +144,12 @@ async def create_response(
     return ResponseResource.model_validate(result)
 
 
-@router.get("/responses/{response_id}", response_model=ResponseResource, tags=["Responses"], responses={**SSE_RESPONSE})
+@router.get(
+    "/responses/{response_id}",
+    response_model=ResponseResource,
+    tags=["Responses"],
+    responses={**_STREAM_OR_JSON, **_NOT_FOUND},
+)
 async def get_response(
     response_id: str,
     stream: bool = Query(False, description="Reattach to the response as SSE."),
@@ -148,13 +167,27 @@ async def get_response(
     payload = project_run(run)
     if not stream:
         return ResponseResource.model_validate(payload)
+    raw_offset = meta_from_params(run.execution_params, run.assistant_id).get("message_offset")
+    message_offset = raw_offset if isinstance(raw_offset, int) and raw_offset > 0 else 0
     return make_sse_response(
-        sse_to_bytes(iter_responses_sse(Run.model_validate(run), payload, starting_after=starting_after)),
+        sse_to_bytes(
+            iter_responses_sse(
+                Run.model_validate(run),
+                payload,
+                starting_after=starting_after,
+                message_offset=message_offset,
+            )
+        ),
         headers=get_sse_headers(),
     )
 
 
-@router.post("/responses/{response_id}/cancel", response_model=ResponseResource, tags=["Responses"])
+@router.post(
+    "/responses/{response_id}/cancel",
+    response_model=ResponseResource,
+    tags=["Responses"],
+    responses={**_NOT_FOUND},
+)
 async def cancel_response(
     response_id: str,
     user: User = Depends(get_current_user),
@@ -180,7 +213,12 @@ async def post_conversation(
     return ConversationResource.model_validate(await create_conversation(session, user, body))
 
 
-@router.get("/conversations/{conversation_id}", response_model=ConversationResource, tags=["Conversations"])
+@router.get(
+    "/conversations/{conversation_id}",
+    response_model=ConversationResource,
+    tags=["Conversations"],
+    responses={**_NOT_FOUND},
+)
 async def get_conversation(
     conversation_id: str,
     user: User = Depends(get_current_user),
@@ -190,7 +228,12 @@ async def get_conversation(
     return ConversationResource.model_validate(await read_conversation(session, user, conversation_id))
 
 
-@router.delete("/conversations/{conversation_id}", response_model=ConversationDeleted, tags=["Conversations"])
+@router.delete(
+    "/conversations/{conversation_id}",
+    response_model=ConversationDeleted,
+    tags=["Conversations"],
+    responses={**_NOT_FOUND},
+)
 async def remove_conversation(
     conversation_id: str,
     user: User = Depends(get_current_user),
@@ -201,7 +244,12 @@ async def remove_conversation(
     return ConversationDeleted(id=conversation_id)
 
 
-@router.get("/conversations/{conversation_id}/items", response_model=ConversationItemList, tags=["Conversations"])
+@router.get(
+    "/conversations/{conversation_id}/items",
+    response_model=ConversationItemList,
+    tags=["Conversations"],
+    responses={**_NOT_FOUND},
+)
 async def get_conversation_items(
     conversation_id: str,
     user: User = Depends(get_current_user),

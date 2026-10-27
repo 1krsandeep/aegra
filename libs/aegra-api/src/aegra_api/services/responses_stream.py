@@ -22,7 +22,8 @@ _TERMINAL_RUN_STATUSES = frozenset({"success", "error", "timeout", "interrupted"
 class ResponsesTranslator:
     """Fold ``messages`` and ``values`` events into Responses SSE payloads."""
 
-    def __init__(self, response: dict[str, Any]) -> None:
+    def __init__(self, response: dict[str, Any], *, message_offset: int = 0) -> None:
+        self._message_offset = message_offset
         self.response = dict(response)
         initial = response.get("output")
         self._initial_output: list[dict[str, Any]] = list(initial) if isinstance(initial, list) else []
@@ -200,7 +201,7 @@ class ResponsesTranslator:
         has_message = any(item.get("type") == "message" for item in self._output_items)
         if has_message or not isinstance(self._last_values, dict):
             return
-        projected = project_response_output(self._last_values)
+        projected = project_response_output(self._last_values, offset=self._message_offset)
         if projected:
             self._copy_output(projected)
 
@@ -232,9 +233,10 @@ async def iter_responses_sse(
     response: dict[str, Any],
     *,
     starting_after: str | None,
+    message_offset: int = 0,
 ) -> AsyncGenerator[str, None]:
     """Stream a run, replaying broker history so deltas stay aligned across reconnects."""
-    translator = ResponsesTranslator(response)
+    translator = ResponsesTranslator(response, message_offset=message_offset)
     if run.status in _TERMINAL_RUN_STATUSES and not streaming_service.is_run_streaming(run.run_id):
         for event in translator.snapshot_events():
             yield encode_responses_event(event, None)

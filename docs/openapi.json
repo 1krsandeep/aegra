@@ -3389,7 +3389,7 @@
         },
         "responses": {
           "200": {
-            "description": "Server-Sent Events stream",
+            "description": "The response object, or a Server-Sent Events stream when stream is true.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3414,7 +3414,7 @@
             }
           },
           "404": {
-            "description": "The response or conversation was not found.",
+            "description": "The response, conversation, or assistant was not found.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3477,7 +3477,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Server-Sent Events stream",
+            "description": "The response object, or a Server-Sent Events stream when stream is true.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3502,7 +3502,7 @@
             }
           },
           "404": {
-            "description": "The response or conversation was not found.",
+            "description": "The response, conversation, or assistant was not found.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3555,7 +3555,7 @@
             }
           },
           "404": {
-            "description": "The response or conversation was not found.",
+            "description": "The response, conversation, or assistant was not found.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3598,16 +3598,6 @@
           },
           "422": {
             "description": "The request was rejected.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OpenAIErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "The response or conversation was not found.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3660,7 +3650,7 @@
             }
           },
           "404": {
-            "description": "The response or conversation was not found.",
+            "description": "The response, conversation, or assistant was not found.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3711,7 +3701,7 @@
             }
           },
           "404": {
-            "description": "The response or conversation was not found.",
+            "description": "The response, conversation, or assistant was not found.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3764,7 +3754,7 @@
             }
           },
           "404": {
-            "description": "The response or conversation was not found.",
+            "description": "The response, conversation, or assistant was not found.",
             "content": {
               "application/json": {
                 "schema": {

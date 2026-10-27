@@ -174,9 +174,11 @@ def project_response(
 ) -> dict[str, Any]:
     """Build a Response object from a run row and its facade metadata."""
     status = response_status(run_status, output)
+    raw_offset = meta.get("message_offset")
+    offset = raw_offset if isinstance(raw_offset, int) and raw_offset > 0 else 0
     items: list[dict[str, Any]] = []
     if status not in ("failed", "in_progress"):
-        items = project_response_output(output)
+        items = project_response_output(output, offset=offset)
     error: dict[str, str] | None = None
     incomplete: dict[str, str] | None = None
     if status == "failed":
@@ -214,10 +216,21 @@ def project_response(
     return body
 
 
-def project_response_output(output: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-    """Assistant-facing output items: messages, tool calls, and approval requests."""
+def retains_stateless_thread(run_status: str, output: Mapping[str, Any] | None) -> bool:
+    """Keep a store=false thread when it is paused on an interrupt the client must answer."""
+    return run_status == "interrupted" and bool(_interrupt_entries(output))
+
+
+def project_response_output(output: Mapping[str, Any] | None, *, offset: int = 0) -> list[dict[str, Any]]:
+    """Assistant-facing output items: messages, tool calls, and approval requests.
+
+    ``offset`` drops messages that were already on the thread before this run.
+    """
+    messages = _messages(output)
+    if offset > 0:
+        messages = messages[offset:]
     items: list[dict[str, Any]] = []
-    for index, message in enumerate(_messages(output)):
+    for index, message in enumerate(messages):
         mapped = _as_mapping(message)
         if mapped is None:
             continue

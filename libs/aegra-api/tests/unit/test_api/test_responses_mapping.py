@@ -16,6 +16,7 @@ from aegra_api.services.responses_mapping import (
     project_response,
     project_response_output,
     response_status,
+    retains_stateless_thread,
     threads_conflict,
 )
 
@@ -276,6 +277,31 @@ def test_project_response_failed_and_incomplete() -> None:
     assert paused["status"] == "incomplete"
     assert paused["incomplete_details"] == {"reason": "approval_required"}
     assert paused["output"][0]["type"] == "mcp_approval_request"
+
+
+def test_output_offset_drops_messages_from_earlier_turns() -> None:
+    """A continued thread's checkpoint includes history; the response shows only this run."""
+    output = {
+        "messages": [
+            {"id": "old", "type": "ai", "content": "Earlier"},
+            {"id": "user", "type": "human", "content": "Next"},
+            {"id": "new", "type": "ai", "content": "Now"},
+        ]
+    }
+
+    items = project_response_output(output, offset=2)
+
+    assert [item["id"] for item in items] == ["new"]
+    assert items[0]["content"][0]["text"] == "Now"
+
+
+def test_stateless_thread_is_kept_only_for_a_pending_interrupt() -> None:
+    """A store=false interrupt has to remain so the client can send an approval."""
+    interrupt = {"__interrupt__": [{"id": "int-1", "value": "wait"}]}
+
+    assert retains_stateless_thread("interrupted", interrupt) is True
+    assert retains_stateless_thread("interrupted", {}) is False
+    assert retains_stateless_thread("success", interrupt) is False
 
 
 def test_bind_resume_keeps_a_single_interrupt_value_and_maps_several() -> None:
