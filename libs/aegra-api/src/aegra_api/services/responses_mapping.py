@@ -43,6 +43,7 @@ class PreparedTurn:
     resume: Any
     rejected: bool
     reject_reason: str | None
+    interrupt_id: str | None = None
 
 
 def conversation_id_of(value: str | dict[str, Any] | None) -> str | None:
@@ -66,6 +67,20 @@ def is_ephemeral(*, store: bool, conversation_id: str | None, previous_response_
 def threads_conflict(conversation_id: str | None, previous_thread_id: str | None) -> bool:
     """True when both ids are set and they are not the same thread."""
     return bool(conversation_id and previous_thread_id and conversation_id != previous_thread_id)
+
+
+def bind_resume(interrupt_id: str, resume: Any, pending_ids: list[str]) -> Any:
+    """Attach a resume value to the interrupt the client named.
+
+    One pending interrupt receives the value directly, which is what
+    ``interrupt()`` yields. Several pending interrupts need LangGraph's
+    id-keyed map so the value cannot land on a different interrupt.
+    """
+    if interrupt_id not in pending_ids:
+        raise ResponsesError(409, f"Interrupt '{interrupt_id}' is not pending")
+    if len(pending_ids) == 1:
+        return resume
+    return {interrupt_id: resume}
 
 
 def response_status(run_status: str, output: Mapping[str, Any] | None) -> str:
@@ -119,15 +134,16 @@ def prepare_turn(body: ResponseCreate) -> PreparedTurn:
         raise ResponsesError(422, "resuming an interrupt requires a conversation or previous_response_id")
 
     if approvals:
-        _require_id(approvals[0].get("approval_request_id"), "mcp_approval_response.approval_request_id")
-        return _approval_turn(approvals[0])
+        interrupt_id = _require_id(approvals[0].get("approval_request_id"), "mcp_approval_response.approval_request_id")
+        return _approval_turn(approvals[0], interrupt_id)
     if call_outputs:
-        _require_id(call_outputs[0].get("call_id"), "function_call_output.call_id")
+        interrupt_id = _require_id(call_outputs[0].get("call_id"), "function_call_output.call_id")
         return PreparedTurn(
             messages=None,
             resume=decode_resume(call_outputs[0].get("output")),
             rejected=False,
             reject_reason=None,
+            interrupt_id=interrupt_id,
         )
 
     built = _items_to_messages(body.instructions, messages)
@@ -293,23 +309,34 @@ def build_responses_meta(
     return meta
 
 
-def _require_id(value: Any, field: str) -> None:
+def _require_id(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ResponsesError(422, f"{field} is required")
+    return value
 
 
-def _approval_turn(item: dict[str, Any]) -> PreparedTurn:
+def _approval_turn(item: dict[str, Any], interrupt_id: str) -> PreparedTurn:
     approve = item.get("approve")
     if not isinstance(approve, bool):
         raise ResponsesError(422, "mcp_approval_response.approve must be a boolean")
     if approve:
         return PreparedTurn(
-            messages=None, resume={"decisions": [{"type": "approve"}]}, rejected=False, reject_reason=None
+            messages=None,
+            resume={"decisions": [{"type": "approve"}]},
+            rejected=False,
+            reject_reason=None,
+            interrupt_id=interrupt_id,
         )
     reason = item.get("reason")
     if reason is not None and not isinstance(reason, str):
         raise ResponsesError(422, "mcp_approval_response.reason must be a string")
-    return PreparedTurn(messages=None, resume=None, rejected=True, reject_reason=reason or "interrupt rejected")
+    return PreparedTurn(
+        messages=None,
+        resume=None,
+        rejected=True,
+        reject_reason=reason or "interrupt rejected",
+        interrupt_id=interrupt_id,
+    )
 
 
 def _message_input(instructions: str | None, text: str) -> dict[str, Any]:

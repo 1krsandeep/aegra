@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from aegra_api.models.responses import ConversationCreate, ResponseCreate, ResponsesError
 from aegra_api.services.responses_mapping import (
+    bind_resume,
     conversation_id_of,
     decode_resume,
     is_ephemeral,
@@ -78,6 +79,7 @@ def test_approval_true_resumes_with_a_hitl_decision() -> None:
     )
 
     assert turn.resume == {"decisions": [{"type": "approve"}]}
+    assert turn.interrupt_id == "int-1"
     assert turn.rejected is False
 
 
@@ -274,6 +276,16 @@ def test_project_response_failed_and_incomplete() -> None:
     assert paused["status"] == "incomplete"
     assert paused["incomplete_details"] == {"reason": "approval_required"}
     assert paused["output"][0]["type"] == "mcp_approval_request"
+
+
+def test_bind_resume_keeps_a_single_interrupt_value_and_maps_several() -> None:
+    """A lone interrupt gets the value directly; several are keyed so the id cannot be dropped."""
+    decision = {"decisions": [{"type": "approve"}]}
+
+    assert bind_resume("int-1", decision, ["int-1"]) == decision
+    assert bind_resume("int-2", decision, ["int-1", "int-2"]) == {"int-2": decision}
+    with pytest.raises(ResponsesError, match="not pending"):
+        bind_resume("int-9", decision, ["int-1"])
 
 
 def test_decode_resume_passes_structured_values_through() -> None:

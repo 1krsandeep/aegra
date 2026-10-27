@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,12 +22,13 @@ from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.models import Run, RunCreate, User
-from aegra_api.models.responses import ConversationCreate, ResponseCreate
+from aegra_api.models.responses import ConversationCreate, ResponseCreate, ResponsesError
 from aegra_api.models.run_job import RunBehavior, RunExecution
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.responses_mapping import (
     PreparedTurn,
+    bind_resume,
     build_responses_meta,
     conversation_id_of,
     is_ephemeral,
@@ -40,6 +42,7 @@ from aegra_api.services.responses_mapping import (
 from aegra_api.services.responses_stream import iter_responses_sse
 from aegra_api.services.run_cleanup import delete_thread_by_id
 from aegra_api.services.run_preparation import _prepare_run
+from aegra_api.services.streaming_service import streaming_service
 from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
 
@@ -110,6 +113,12 @@ async def execute_response(session: AsyncSession, user: User, body: ResponseCrea
     resolved = await resolve_thread(session, user, body)
     await _authorize_thread(user, resolved)
 
+    pending: list[str] = []
+    if turn.interrupt_id is not None:
+        pending = await pending_interrupt_ids(session, resolved.thread_id, user.identity)
+        if turn.interrupt_id not in pending:
+            raise ResponsesError(409, f"Interrupt '{turn.interrupt_id}' is not pending")
+
     if turn.rejected:
         if resolved.thread is None or resolved.thread.status != "interrupted":
             raise HTTPException(409, "Cannot reject an approval when the conversation is not interrupted")
@@ -118,7 +127,8 @@ async def execute_response(session: AsyncSession, user: User, body: ResponseCrea
             session, user, body, resolved.thread, turn.reject_reason or "interrupt rejected"
         )
 
-    request = _run_create(body, turn)
+    resume = bind_resume(turn.interrupt_id, turn.resume, pending) if turn.interrupt_id else turn.resume
+    request = _run_create(body, turn, resume=resume)
     await _apply_create_run_auth(user, resolved.thread_id, request)
     meta = build_responses_meta(body, conversation_id=conversation_id_of(body.conversation))
     run_id, run_model, _job = await _prepare_run(
@@ -147,29 +157,29 @@ async def execute_response(session: AsyncSession, user: User, body: ResponseCrea
         return payload
 
     try:
-        await executor.wait_for_completion(run_id, timeout=float(settings.worker.BG_JOB_TIMEOUT_SECS))
-    except TimeoutError:
-        logger.warning("responses wait timed out", run_id=run_id)
-        return await _timeout_payload(run_id, user.identity)
-    fresh = await _reload_run(run_id, user.identity)
-    if fresh is None:
-        raise HTTPException(404, f"Response '{run_id}' not found")
-    payload = project_run(fresh)
-    if resolved.ephemeral:
-        await delete_thread_by_id(resolved.thread_id, user.identity)
-    return payload
+        try:
+            await executor.wait_for_completion(run_id, timeout=float(settings.worker.BG_JOB_TIMEOUT_SECS))
+        except TimeoutError:
+            logger.warning("responses wait timed out", run_id=run_id)
+            await streaming_service.cancel_run(run_id)
+            return await _timeout_payload(run_id, user.identity)
+        fresh = await _reload_run(run_id, user.identity)
+        if fresh is None:
+            raise HTTPException(404, f"Response '{run_id}' not found")
+        return project_run(fresh)
+    finally:
+        if resolved.ephemeral:
+            await asyncio.shield(delete_thread_by_id(resolved.thread_id, user.identity))
 
 
 async def iter_response_sse(started: StartedRun, *, starting_after: str | None) -> AsyncGenerator[str, None]:
-    """Follow a started run and delete a stateless thread once the stream finishes."""
-    completed = False
+    """Follow a started run and delete a stateless thread when the stream ends."""
     try:
         async for frame in iter_responses_sse(started.run, started.payload, starting_after=starting_after):
             yield frame
-        completed = True
     finally:
-        if started.ephemeral and completed:
-            await delete_thread_by_id(started.thread_id, started.user_id)
+        if started.ephemeral:
+            await asyncio.shield(delete_thread_by_id(started.thread_id, started.user_id))
 
 
 async def resolve_thread(session: AsyncSession, user: User, body: ResponseCreate) -> ResolvedThread:
@@ -326,12 +336,12 @@ async def _persist_rejection(
     return project_run(run)
 
 
-def _run_create(body: ResponseCreate, turn: PreparedTurn) -> RunCreate:
-    if turn.resume is not None:
+def _run_create(body: ResponseCreate, turn: PreparedTurn, *, resume: Any) -> RunCreate:
+    if turn.interrupt_id is not None:
         return RunCreate(
             assistant_id=body.model,
             input=None,
-            command={"resume": turn.resume},
+            command={"resume": resume},
             stream_mode=_RESPONSE_STREAM_MODES,
         )
     return RunCreate(
@@ -339,6 +349,26 @@ def _run_create(body: ResponseCreate, turn: PreparedTurn) -> RunCreate:
         input=turn.messages,
         stream_mode=_RESPONSE_STREAM_MODES,
     )
+
+
+async def pending_interrupt_ids(session: AsyncSession, thread_id: str, user_id: str) -> list[str]:
+    """Ids of interrupts on the caller's latest interrupted run for this thread."""
+    run = await session.scalar(
+        select(RunORM)
+        .where(
+            RunORM.thread_id == thread_id,
+            RunORM.user_id == user_id,
+            RunORM.status == "interrupted",
+        )
+        .order_by(RunORM.created_at.desc())
+        .limit(1)
+    )
+    if run is None or not isinstance(run.output, dict):
+        return []
+    raw = run.output.get("__interrupt__")
+    if not isinstance(raw, list):
+        return []
+    return [entry["id"] for entry in raw if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
 
 
 async def _reload_run(run_id: str, user_id: str) -> RunORM | None:

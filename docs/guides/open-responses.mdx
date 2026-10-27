@@ -66,6 +66,6 @@ That includes non-empty `tools`, a `tool_choice` other than `auto` or `none`, `t
 
 A pending interrupt is an `mcp_approval_request` item whose id is the LangGraph interrupt id. The response status is `incomplete`.
 
-`mcp_approval_response` with `approve: true` resumes with `Command(resume={"decisions": [{"type": "approve"}]})`, which is what LangChain's human-in-the-loop middleware expects. `approve: false` does not resume. The response fails with `code: "interrupt_rejected"` and the checkpoint stays interrupted so a later approval can retry.
+`mcp_approval_response` with `approve: true` resumes with `Command(resume={"decisions": [{"type": "approve"}]})`, which is what LangChain's human-in-the-loop middleware expects. The `approval_request_id` has to be a pending interrupt on that thread, or the request is `409`. When several interrupts are pending, the same value is sent as a map keyed by that id so it cannot be applied to a different one. `approve: false` does not resume. The response fails with `code: "interrupt_rejected"` and the checkpoint stays interrupted so a later approval can retry.
 
 Graphs in this repo that expect a custom resume value, such as `[{"type": "accept"}]`, send that JSON as a `function_call_output` whose `call_id` is the interrupt id. `edit` and `respond` travel only on that channel.
