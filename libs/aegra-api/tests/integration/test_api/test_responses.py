@@ -95,7 +95,7 @@ def _use_maker(monkeypatch: pytest.MonkeyPatch, row: Any) -> None:
     """Point response preparation at the scripted session instead of a live engine."""
     monkeypatch.setattr(
         "aegra_api.services.responses_service._get_session_maker",
-        lambda: (lambda: ScalarSession(row)),
+        lambda: lambda: ScalarSession(row),
     )
 
 
@@ -367,6 +367,37 @@ def test_create_conversation_keeps_handler_metadata_and_ttl(monkeypatch: pytest.
     assert thread.metadata_json["owner"] == "test-user"
     assert thread.metadata_json["responses_metadata"] == {"topic": "weather"}
     assert added[1].kind == "ttl"
+
+
+def test_create_conversation_keeps_metadata_the_handler_writes_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    """threads.create may inject team metadata by mutating the value dict and returning nothing."""
+    added: list[Any] = []
+
+    class RecordingSession(ScalarSession):
+        def add(self, obj: Any) -> None:
+            added.append(obj)
+
+    async def spy(ctx: Any, value: dict[str, Any]) -> None:
+        if ctx.resource == "threads" and ctx.action == "create":
+            metadata = value.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                value["metadata"] = metadata
+            metadata["team_id"] = "team-1"
+        return None
+
+    monkeypatch.setattr("aegra_api.services.responses_service.handle_event", spy)
+    app = create_test_app(include_runs=False, include_threads=False, include_responses=True)
+    app.dependency_overrides[get_session] = override_get_session_dep(lambda: RecordingSession(None))
+    client = make_client(app)
+
+    response = client.post("/v1/conversations", json={"metadata": {"topic": "weather"}})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["metadata"] == {"topic": "weather"}
+    thread = added[0]
+    assert thread.metadata_json["team_id"] == "team-1"
+    assert thread.metadata_json["responses_metadata"] == {"topic": "weather"}
 
 
 def test_read_conversation_applies_the_handler_filter(monkeypatch: pytest.MonkeyPatch) -> None:

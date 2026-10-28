@@ -227,7 +227,11 @@ class StreamingService:
         run_id: str,
         last_event_id: str | None,
     ) -> AsyncIterator[tuple[str, str, Any]]:
-        broker = broker_manager.get_or_create_broker(run_id)
+        # Creating a broker here leaves an unfinished queue. A finished run whose
+        # buffer was already evicted then blocks in the live iterator forever.
+        broker = broker_manager.get_broker(run_id)
+        if broker is None:
+            return
         for event_id, raw_event in await broker.replay(last_event_id):
             parsed = parse_broker_event(raw_event)
             if parsed is not None:

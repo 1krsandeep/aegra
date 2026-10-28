@@ -1,5 +1,7 @@
 """Unit tests for translating broker events into Responses SSE."""
 
+import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -160,8 +162,6 @@ def test_native_message_events_become_text_deltas() -> None:
 
 
 def _run(status: str) -> Run:
-    from datetime import UTC, datetime
-
     now = datetime(2026, 1, 2, tzinfo=UTC)
     return Run(
         run_id="run-1",
@@ -219,6 +219,64 @@ async def test_evicted_cursor_resumes_from_later_sequences(monkeypatch: pytest.M
 
     assert any("response.completed" in frame for frame in frames)
     assert not any("no longer available" in frame for frame in frames)
+
+
+def test_native_deltas_stop_when_the_message_closes() -> None:
+    """A delta after message-finish, or during a tool message, must not extend closed text."""
+    translator = ResponsesTranslator(_response())
+    translator.feed("messages", {"event": "message-start", "id": "m1", "role": "assistant"})
+    translator.feed(
+        "messages",
+        {"event": "content-block-delta", "delta": {"type": "text-delta", "text": "Hi"}},
+    )
+    translator.feed("messages", {"event": "message-finish", "id": "m1"})
+    after_close = translator.feed(
+        "messages",
+        {"event": "content-block-delta", "delta": {"type": "text-delta", "text": " again"}},
+    )
+    translator.feed("messages", {"event": "message-start", "id": "m2", "role": "assistant"})
+    translator.feed("messages", {"event": "message-start", "id": "tool-1", "role": "tool"})
+    during_tool = translator.feed(
+        "messages",
+        {"event": "content-block-delta", "delta": {"type": "text-delta", "text": "nope"}},
+    )
+
+    texts = [
+        item["content"][0]["text"]
+        for item in translator._output_items
+        if item.get("type") == "message" and item.get("content")
+    ]
+    assert after_close == []
+    assert during_tool == []
+    assert texts[0] == "Hi"
+    assert "again" not in "".join(texts)
+    assert "nope" not in "".join(texts)
+
+
+@pytest.mark.asyncio
+async def test_finished_response_without_a_broker_snapshots() -> None:
+    """A terminal run whose broker was evicted returns the saved response instead of hanging."""
+    run = _run("success")
+    run.run_id = "run-finished-no-broker"
+    saved = _response()
+    saved["status"] = "completed"
+    saved["output"] = [
+        {
+            "id": "m1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Hi", "annotations": []}],
+        }
+    ]
+
+    frames: list[str] = []
+    async with asyncio.timeout(2):
+        async for frame in iter_responses_sse(run, saved, starting_after=None):
+            frames.append(frame)
+
+    assert any("response.completed" in frame for frame in frames)
+    assert any("Hi" in frame for frame in frames)
 
 
 def test_encode_uses_the_event_type_as_the_sse_name() -> None:

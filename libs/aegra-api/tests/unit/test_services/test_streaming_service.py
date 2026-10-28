@@ -379,6 +379,28 @@ class TestStreamingService:
             assert service.is_run_streaming("run-1") is False
 
     @pytest.mark.asyncio
+    async def test_terminal_run_without_a_broker_does_not_wait(self) -> None:
+        """Replay must not create an empty broker, or a finished run hangs waiting for events."""
+        service = StreamingService()
+        run = Run(
+            run_id="run-finished",
+            status="success",
+            user_id="user-1",
+            thread_id="thread-1",
+            assistant_id="agent",
+            input={"message": "hello"},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+
+        with patch("aegra_api.services.streaming_service.broker_manager") as mock_manager:
+            mock_manager.get_broker.return_value = None
+            events = [event async for event in service.iter_broker_events(run, None)]
+
+        assert events == []
+        mock_manager.get_or_create_broker.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_cleanup_run(self) -> None:
         """Test run cleanup"""
         service = StreamingService()

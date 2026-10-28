@@ -1,6 +1,7 @@
 """Unit tests for run_executor service."""
 
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -229,6 +230,49 @@ class TestStreamNativeV2InterruptDetection:
     async def test_no_interrupt_when_absent(self) -> None:
         event = {"params": {"data": {"messages": []}}}
         assert await self._run(("values", event)) is False
+
+    @pytest.mark.asyncio
+    async def test_later_values_keep_the_interrupt_in_the_persisted_output(self) -> None:
+        """A values snapshot after the interrupt must not drop the ids the client will resume."""
+        result = _GraphResult()
+
+        async def gen(**_kwargs: object) -> Any:
+            yield ("values", {"__interrupt__": [{"id": "int-1", "value": "wait"}]})
+            yield ("values", {"messages": [{"content": "Hi"}]})
+
+        with (
+            patch.object(run_executor_module, "stream_graph_events", lambda **_kwargs: gen()),
+            patch.object(run_executor_module, "broker_manager") as bm,
+            patch.object(run_executor_module, "streaming_service") as ss,
+        ):
+            bm.allocate_event_id = AsyncMock(return_value="run-1_event_1")
+            ss.put_to_broker = AsyncMock()
+            await _stream_legacy(_make_job(), MagicMock(), {"msg": "x"}, {}, ["values"], result)
+
+        output = result.persisted_output()
+        assert output["messages"] == [{"content": "Hi"}]
+        assert output["__interrupt__"] == [{"id": "int-1", "value": "wait"}]
+
+    @pytest.mark.asyncio
+    async def test_native_values_keep_interrupts_from_params(self) -> None:
+        """params.interrupts survive a later values event that only carries state."""
+        result = _GraphResult()
+        first = {"params": {"data": {"messages": []}, "interrupts": [{"id": "i1", "value": 1}]}}
+        second = {"params": {"data": {"messages": [{"content": "Hi"}]}}}
+        with (
+            patch.object(
+                run_executor_module, "stream_native_v3_events", _v3_stream(("values", first), ("values", second))
+            ),
+            patch.object(run_executor_module, "broker_manager") as bm,
+            patch.object(run_executor_module, "streaming_service") as ss,
+        ):
+            bm.allocate_event_id = AsyncMock(return_value="run-1_event_1")
+            ss.put_to_broker = AsyncMock()
+            await _stream_native_v2(_make_job(), MagicMock(), {"msg": "x"}, {}, result)
+
+        output = result.persisted_output()
+        assert output["messages"] == [{"content": "Hi"}]
+        assert output["__interrupt__"] == [{"id": "i1", "value": 1}]
 
 
 class TestDurabilityForwarding:

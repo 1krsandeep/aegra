@@ -35,6 +35,7 @@ class ResponsesTranslator:
         self._output_items: list[dict[str, Any]] = []
         self._interrupt_ids: set[str] = set()
         self._last_values: dict[str, Any] | None = None
+        self._native_item_id: str | None = None
         self._closed = False
         self.saw_interrupt = False
 
@@ -249,6 +250,7 @@ class ResponsesTranslator:
         if kind == "message-start":
             role = data.get("role")
             if isinstance(role, str) and role.lower() not in ("ai", "assistant"):
+                self._native_item_id = None
                 return []
             raw_id = data.get("id")
             item_id = raw_id if isinstance(raw_id, str) else "msg"
@@ -257,9 +259,9 @@ class ResponsesTranslator:
         if kind == "content-block-delta":
             delta = data.get("delta")
             text = delta.get("text") if isinstance(delta, dict) else None
-            if not isinstance(text, str) or not text:
+            item_id = self._native_item_id
+            if not isinstance(text, str) or not text or item_id is None:
                 return []
-            item_id = getattr(self, "_native_item_id", None) or "msg"
             events = self._ensure_open(item_id)
             self._text[item_id] = self._text.get(item_id, "") + text
             events.append(
@@ -273,7 +275,8 @@ class ResponsesTranslator:
             )
             return events
         if kind == "message-finish":
-            item_id = getattr(self, "_native_item_id", None)
+            item_id = self._native_item_id
+            self._native_item_id = None
             if not isinstance(item_id, str) or item_id not in self._opened:
                 return []
             return self._close_message(item_id, self._text.get(item_id, ""))

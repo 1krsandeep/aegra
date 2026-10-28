@@ -25,6 +25,7 @@ from aegra_api.core.orm import _get_session_maker
 from aegra_api.models import Run, RunCreate, User
 from aegra_api.models.responses import ConversationCreate, ResponseCreate, ResponsesError
 from aegra_api.models.run_job import RunBehavior, RunExecution
+from aegra_api.services.broker import broker_manager
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.responses_mapping import (
@@ -44,7 +45,8 @@ from aegra_api.services.responses_mapping import (
 from aegra_api.services.responses_stream import iter_responses_sse
 from aegra_api.services.run_cleanup import delete_thread_by_id
 from aegra_api.services.run_preparation import _prepare_run
-from aegra_api.services.streaming_service import streaming_service
+from aegra_api.services.run_status import ACTIVE_RUN_STATES
+from aegra_api.services.streaming_service import parse_broker_event, streaming_service
 from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
 
@@ -246,11 +248,14 @@ async def resolve_thread(session: AsyncSession, user: User, body: ResponseCreate
 
 async def create_conversation(session: AsyncSession, user: User, body: ConversationCreate) -> dict[str, Any]:
     """Create an empty thread and return it as a conversation."""
+    # Snapshot first. Handlers mutate this dict in place, and injected keys must
+    # stay out of the client metadata that is copied under responses_metadata.
+    client_metadata = dict(body.metadata) if body.metadata else None
     value = body.model_dump()
     filters = await handle_event(build_auth_context(user, "threads", "create"), value)
     now = datetime.now(UTC)
     thread_id = str(uuid4())
-    metadata = _conversation_metadata(body.metadata, filters, value, owner=user.identity)
+    metadata = _conversation_metadata(client_metadata, filters, value, owner=user.identity)
     thread = ThreadORM(
         thread_id=thread_id,
         status="idle",
@@ -457,8 +462,8 @@ async def _pending_on_fresh_session(thread_id: str, user_id: str) -> list[str]:
 
 
 async def pending_interrupt_ids(session: AsyncSession, thread_id: str, user_id: str) -> list[str]:
-    """Ids of interrupts on the caller's latest interrupted run for this thread."""
-    run = await session.scalar(
+    """Ids the caller can resume. The broker has them before the run row commits."""
+    interrupted = await session.scalar(
         select(RunORM)
         .where(
             RunORM.thread_id == thread_id,
@@ -468,12 +473,54 @@ async def pending_interrupt_ids(session: AsyncSession, thread_id: str, user_id: 
         .order_by(RunORM.created_at.desc())
         .limit(1)
     )
-    if run is None or not isinstance(run.output, dict):
+    if interrupted is not None:
+        ids = _interrupt_ids_from_output(interrupted.output)
+        if not ids:
+            ids = await _interrupt_ids_from_broker(interrupted.run_id)
+        if ids:
+            return ids
+
+    active = await session.scalar(
+        select(RunORM)
+        .where(
+            RunORM.thread_id == thread_id,
+            RunORM.user_id == user_id,
+            RunORM.status.in_(ACTIVE_RUN_STATES),
+        )
+        .order_by(RunORM.created_at.desc())
+        .limit(1)
+    )
+    if active is None:
         return []
-    raw = run.output.get("__interrupt__")
+    return await _interrupt_ids_from_broker(active.run_id)
+
+
+def _interrupt_ids_from_output(output: Any) -> list[str]:
+    if not isinstance(output, dict):
+        return []
+    raw = output.get("__interrupt__")
     if not isinstance(raw, list):
         return []
     return [entry["id"] for entry in raw if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
+
+
+async def _interrupt_ids_from_broker(run_id: str) -> list[str]:
+    """Interrupt ids already streamed for a run whose row is not committed yet."""
+    broker = broker_manager.get_broker(run_id)
+    if broker is None:
+        return []
+    found: list[str] = []
+    for _event_id, raw_event in await broker.replay(None):
+        parsed = parse_broker_event(raw_event)
+        if parsed is None:
+            continue
+        event_type, payload = parsed
+        if event_type != "values" and not event_type.startswith("values"):
+            continue
+        for interrupt_id in _interrupt_ids_from_output(payload):
+            if interrupt_id not in found:
+                found.append(interrupt_id)
+    return found
 
 
 async def _reload_run(run_id: str, user_id: str) -> RunORM | None:
