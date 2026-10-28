@@ -15,6 +15,7 @@ from aegra_api.services.responses_mapping import (
     project_response_output,
 )
 from aegra_api.services.streaming_service import streaming_service
+from aegra_api.utils.sse_utils import extract_event_sequence
 
 _TERMINAL_RUN_STATUSES = frozenset({"success", "error", "timeout", "interrupted"})
 
@@ -53,6 +54,8 @@ class ResponsesTranslator:
             return []
         if event_type in ("messages/partial", "messages/complete"):
             return self._on_messages(event_type, payload)
+        if event_type == "messages":
+            return self._on_native_message(payload)
         if event_type == "values" or event_type.startswith("values"):
             if isinstance(payload, dict):
                 self._last_values = payload
@@ -181,14 +184,14 @@ class ResponsesTranslator:
         if status == "interrupted" and self.saw_interrupt:
             self.response["status"] = "incomplete"
             self.response["incomplete_details"] = {"reason": "approval_required"}
-            self._fill_from_values_if_empty()
+            self._reconcile_final_values()
             return [self._terminal("response.incomplete")]
         if status == "interrupted":
             self.response["status"] = "cancelled"
-            self._fill_from_values_if_empty()
+            self._reconcile_final_values()
             return [self._terminal("response.completed")]
         self.response["status"] = "completed"
-        self._fill_from_values_if_empty()
+        self._reconcile_final_values()
         return [self._terminal("response.completed")]
 
     def _fail(self, message: str) -> list[dict[str, Any]]:
@@ -196,14 +199,85 @@ class ResponsesTranslator:
         self.response["error"] = {"code": "server_error", "message": message}
         return [self._terminal("response.failed")]
 
-    def _fill_from_values_if_empty(self) -> None:
-        """Use the last values snapshot when no assistant message was streamed."""
-        has_message = any(item.get("type") == "message" for item in self._output_items)
-        if has_message or not isinstance(self._last_values, dict):
+    def _reconcile_final_values(self) -> None:
+        """Close unfinished messages and merge tool calls from the final state."""
+        self._close_open_messages()
+        if not isinstance(self._last_values, dict):
+            self.response["output"] = list(self._output_items)
             return
         projected = project_response_output(self._last_values, offset=self._message_offset)
-        if projected:
+        if not self._output_items:
             self._copy_output(projected)
+            return
+        message_index = {
+            item["id"]: index
+            for index, item in enumerate(self._output_items)
+            if item.get("type") == "message" and isinstance(item.get("id"), str)
+        }
+        seen = {(item.get("type"), item.get("id"), item.get("call_id")) for item in self._output_items}
+        for item in projected:
+            if item.get("type") == "message" and item.get("id") in message_index:
+                index = message_index[item["id"]]
+                if len(_item_text(item)) >= len(_item_text(self._output_items[index])):
+                    self._output_items[index] = item
+                continue
+            key = (item.get("type"), item.get("id"), item.get("call_id"))
+            if key not in seen:
+                self._output_items.append(item)
+                seen.add(key)
+        self.response["output"] = list(self._output_items)
+
+    def _close_open_messages(self) -> None:
+        for index, item in enumerate(self._output_items):
+            if item.get("type") != "message" or item.get("status") != "in_progress":
+                continue
+            raw_id = item.get("id")
+            item_id = raw_id if isinstance(raw_id, str) else "msg"
+            text = self._text.get(item_id, "")
+            self._output_items[index] = {
+                **item,
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+
+    def _on_native_message(self, payload: Any) -> list[dict[str, Any]]:
+        """Translate an Agent Protocol v2 ``messages`` event into Responses deltas."""
+        data = _native_message_data(payload)
+        if data is None:
+            return []
+        kind = data.get("event")
+        if kind == "message-start":
+            role = data.get("role")
+            if isinstance(role, str) and role.lower() not in ("ai", "assistant"):
+                return []
+            raw_id = data.get("id")
+            item_id = raw_id if isinstance(raw_id, str) else "msg"
+            self._native_item_id = item_id
+            return self._ensure_open(item_id)
+        if kind == "content-block-delta":
+            delta = data.get("delta")
+            text = delta.get("text") if isinstance(delta, dict) else None
+            if not isinstance(text, str) or not text:
+                return []
+            item_id = getattr(self, "_native_item_id", None) or "msg"
+            events = self._ensure_open(item_id)
+            self._text[item_id] = self._text.get(item_id, "") + text
+            events.append(
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": item_id,
+                    "output_index": self._indexes[item_id],
+                    "content_index": 0,
+                    "delta": text,
+                }
+            )
+            return events
+        if kind == "message-finish":
+            item_id = getattr(self, "_native_item_id", None)
+            if not isinstance(item_id, str) or item_id not in self._opened:
+                return []
+            return self._close_message(item_id, self._text.get(item_id, ""))
+        return []
 
     def _copy_output(self, items: list[dict[str, Any]]) -> None:
         self._output_items = items
@@ -235,26 +309,51 @@ async def iter_responses_sse(
     starting_after: str | None,
     message_offset: int = 0,
 ) -> AsyncGenerator[str, None]:
-    """Stream a run, replaying broker history so deltas stay aligned across reconnects."""
+    """Stream a run. Replay stored events first; snapshot only when that history is gone."""
     translator = ResponsesTranslator(response, message_offset=message_offset)
-    if run.status in _TERMINAL_RUN_STATUSES and not streaming_service.is_run_streaming(run.run_id):
-        for event in translator.snapshot_events():
-            yield encode_responses_event(event, None)
-        return
-
-    past = starting_after is None
-    if past:
+    if starting_after is None:
         for event in translator.opening_events():
             yield encode_responses_event(event, None)
 
+    cursor_seq = _cursor_sequence(starting_after)
+    cursor_found = starting_after is None
+    saw_event = False
     async for event_id, event_type, payload in streaming_service.iter_broker_events(run, None):
+        saw_event = True
         produced = translator.feed(event_type, payload)
-        if not past:
-            if event_id == starting_after:
-                past = True
+        if starting_after is None:
+            for event in produced:
+                yield encode_responses_event(event, event_id)
             continue
-        for event in produced:
-            yield encode_responses_event(event, event_id)
+        if event_id == starting_after:
+            cursor_found = True
+            continue
+        if cursor_found or (cursor_seq is not None and extract_event_sequence(event_id) > cursor_seq):
+            cursor_found = True
+            for event in produced:
+                yield encode_responses_event(event, event_id)
+
+    if starting_after is not None and not cursor_found:
+        if not saw_event and run.status in _TERMINAL_RUN_STATUSES:
+            for event in translator.snapshot_events():
+                yield encode_responses_event(event, None)
+            return
+        yield encode_responses_event(
+            {
+                "type": "error",
+                "error": {
+                    "message": "starting_after is no longer available",
+                    "type": "invalid_request_error",
+                    "code": "invalid_cursor",
+                },
+            },
+            None,
+        )
+        return
+
+    if not saw_event and run.status in _TERMINAL_RUN_STATUSES:
+        for event in translator.snapshot_events():
+            yield encode_responses_event(event, None)
 
 
 def _message_payloads(payload: Any) -> list[Any]:
@@ -263,6 +362,32 @@ def _message_payloads(payload: Any) -> list[Any]:
     if payload is None:
         return []
     return [payload]
+
+
+def _cursor_sequence(event_id: str | None) -> int | None:
+    """Numeric suffix of a broker event id, or None when the id is not one of ours."""
+    if event_id is None or "_event_" not in event_id:
+        return None
+    sequence = extract_event_sequence(event_id)
+    return sequence if sequence > 0 else None
+
+
+def _native_message_data(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict) and isinstance(payload.get("event"), str):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("params", {}).get("data") if isinstance(payload.get("params"), dict) else None
+        if isinstance(data, dict) and isinstance(data.get("event"), str):
+            return data
+    return None
+
+
+def _item_text(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+        return ""
+    text = content[0].get("text")
+    return text if isinstance(text, str) else ""
 
 
 def _error_message(payload: Any) -> str:

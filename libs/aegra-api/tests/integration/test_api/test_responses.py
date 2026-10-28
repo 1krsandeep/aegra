@@ -91,6 +91,14 @@ def _install_auth_spy(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     return calls
 
 
+def _use_maker(monkeypatch: pytest.MonkeyPatch, row: Any) -> None:
+    """Point response preparation at the scripted session instead of a live engine."""
+    monkeypatch.setattr(
+        "aegra_api.services.responses_service._get_session_maker",
+        lambda: (lambda: ScalarSession(row)),
+    )
+
+
 def _client(monkeypatch: pytest.MonkeyPatch, row: Any) -> tuple[TestClient, ScalarSession, list[tuple[str, str]]]:
     app = create_test_app(include_runs=False, include_threads=False, include_responses=True)
     session = ScalarSession(row)
@@ -143,9 +151,8 @@ def test_sync_response_returns_assistant_text_and_authorizes_the_run(
     )
     deleted: list[str] = []
 
-    async def fake_delete(thread_id: str, user_id: str) -> None:
+    async def fake_delete(_thread_id: str, user_id: str) -> None:
         deleted.append(user_id)
-        del thread_id
 
     monkeypatch.setattr("aegra_api.services.responses_service.delete_thread_by_id", fake_delete)
     client, _session, calls = _client(monkeypatch, finished)
@@ -174,6 +181,7 @@ def test_background_response_returns_without_waiting(
     pending.execution_params["responses_meta"]["background"] = True
     wait = AsyncMock()
     monkeypatch.setattr("aegra_api.services.responses_service.executor.wait_for_completion", wait)
+    _use_maker(monkeypatch, pending)
     client, _session, _calls = _client(monkeypatch, pending)
 
     response = client.post(
@@ -203,7 +211,9 @@ def test_stream_response_emits_responses_sse(
         "aegra_api.services.responses_stream.streaming_service.iter_broker_events",
         fake_iter,
     )
-    client, _session, _calls = _client(monkeypatch, _run(status="pending", output=None))
+    pending = _run(status="pending", output=None)
+    _use_maker(monkeypatch, pending)
+    client, _session, _calls = _client(monkeypatch, pending)
 
     response = client.post("/v1/responses", json={"model": "agent", "input": "Hi", "stream": True, "store": True})
 
@@ -248,7 +258,9 @@ def test_cancel_projects_a_cancelled_response(monkeypatch: pytest.MonkeyPatch) -
 
 def test_mismatched_conversation_and_previous_response_is_422(monkeypatch: pytest.MonkeyPatch) -> None:
     """The two thread selectors have to name the same thread."""
-    client, _session, _calls = _client(monkeypatch, SimpleNamespace(thread_id="thread-a"))
+    previous = SimpleNamespace(thread_id="thread-a")
+    _use_maker(monkeypatch, previous)
+    client, _session, _calls = _client(monkeypatch, previous)
 
     response = client.post(
         "/v1/responses",
@@ -321,3 +333,53 @@ def test_conversation_crud_and_items(monkeypatch: pytest.MonkeyPatch) -> None:
     assert deleted.status_code == 200, deleted.text
     assert deleted.json()["deleted"] is True
     assert ("threads", "delete") in calls
+
+
+def test_create_conversation_keeps_handler_metadata_and_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """threads.create may inject metadata, and the server TTL row is written with the thread."""
+    added: list[Any] = []
+
+    class RecordingSession(ScalarSession):
+        def add(self, obj: Any) -> None:
+            added.append(obj)
+
+    async def spy(ctx: Any, value: dict[str, Any]) -> dict[str, Any] | None:
+        if ctx.resource == "threads" and ctx.action == "create":
+            return {"metadata": {"team_id": "team-1"}}
+        return None
+
+    monkeypatch.setattr("aegra_api.services.responses_service.handle_event", spy)
+    monkeypatch.setattr("aegra_api.api.threads.handle_event", spy)
+    monkeypatch.setattr(
+        "aegra_api.services.responses_service._resolve_ttl_row",
+        lambda thread_id, _requested: SimpleNamespace(thread_id=thread_id, kind="ttl"),
+    )
+    app = create_test_app(include_runs=False, include_threads=False, include_responses=True)
+    app.dependency_overrides[get_session] = override_get_session_dep(lambda: RecordingSession(None))
+    client = make_client(app)
+
+    response = client.post("/v1/conversations", json={"metadata": {"topic": "weather"}})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["metadata"] == {"topic": "weather"}
+    thread = added[0]
+    assert thread.metadata_json["team_id"] == "team-1"
+    assert thread.metadata_json["owner"] == "test-user"
+    assert thread.metadata_json["responses_metadata"] == {"topic": "weather"}
+    assert added[1].kind == "ttl"
+
+
+def test_read_conversation_applies_the_handler_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A threads.read metadata filter is part of the conversation lookup, not discarded."""
+
+    async def spy(_ctx: Any, _value: dict[str, Any]) -> dict[str, str]:
+        return {"metadata": {"team_id": "team-1"}}
+
+    client, session, _calls = _client(monkeypatch, None)
+    monkeypatch.setattr("aegra_api.services.responses_service.handle_event", spy)
+
+    response = client.get("/v1/conversations/conv-1")
+
+    assert response.status_code == 404
+    compiled = str(session.statements[-1].compile(dialect=postgresql.dialect()))
+    assert "metadata_json @>" in compiled

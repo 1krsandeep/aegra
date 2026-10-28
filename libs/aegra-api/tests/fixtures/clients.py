@@ -3,6 +3,7 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from aegra_api.api import responses as responses_module
 from aegra_api.core.auth_deps import get_current_user, require_auth
 from aegra_api.core.health import router as health_router
 from aegra_api.models.auth import User
@@ -50,8 +51,6 @@ def create_test_app(
         app.include_router(stateless_runs_module.router)
 
     if include_responses:
-        from aegra_api.api import responses as responses_module
-
         app.include_router(responses_module.router)
 
     return app

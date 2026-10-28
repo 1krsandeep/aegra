@@ -48,7 +48,7 @@ response = client.responses.create(
 print(response.output_text)
 ```
 
-`store` defaults to `false`. A call with no conversation and no `previous_response_id` then runs on a thread that is deleted after the response is returned. `background: true` requires `store: true`, because a later GET needs the run to still exist.
+`store` defaults to `false`. A call with no conversation and no `previous_response_id` then runs on a thread that is deleted after the response is returned, unless the run stops on an approval interrupt. That response is `incomplete` and the thread is kept so the client can resume it with `previous_response_id`. `background: true` requires `store: true`, because a later GET needs the run to still exist.
 
 `model` must already be an assistant you can run. Graph ids resolve to the system assistant Aegra creates at startup for each graph in `aegra.json`.
 

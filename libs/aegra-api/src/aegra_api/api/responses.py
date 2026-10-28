@@ -130,10 +130,9 @@ def _cancel_on_disconnect(run_id: str) -> Callable[[MutableMapping[str, Any]], A
 async def create_response(
     body: ResponseCreate,
     user: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
 ) -> ResponseResource | EventSourceResponse:
     """Create a response. ``stream: true`` returns SSE. Mounted only when http.responses is true."""
-    result = await execute_response(session, user, body)
+    result = await execute_response(user, body)
     if isinstance(result, StartedRun):
         close_handler = _cancel_on_disconnect(result.run.run_id) if result.cancel_on_disconnect else None
         return make_sse_response(
@@ -152,6 +151,7 @@ async def create_response(
 )
 async def get_response(
     response_id: str,
+    *,
     stream: bool = Query(False, description="Reattach to the response as SSE."),
     starting_after: str | None = Query(None, description="Replay broker events after this id."),
     user: User = Depends(get_current_user),

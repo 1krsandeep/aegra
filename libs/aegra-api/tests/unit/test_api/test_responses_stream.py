@@ -2,7 +2,10 @@
 
 from typing import Any
 
-from aegra_api.services.responses_stream import ResponsesTranslator, encode_responses_event
+import pytest
+
+from aegra_api.models import Run
+from aegra_api.services.responses_stream import ResponsesTranslator, encode_responses_event, iter_responses_sse
 
 
 def _response() -> dict[str, Any]:
@@ -110,6 +113,112 @@ def test_snapshot_of_a_finished_response_includes_its_output() -> None:
     assert events[0]["type"] == "response.created"
     assert events[-1]["type"] == "response.completed"
     assert events[-1]["response"]["output"][0]["content"][0]["text"] == "Done"
+
+
+def test_end_closes_a_partial_message_and_keeps_tool_calls() -> None:
+    """A partial without a complete event still finishes from the final values, including tools."""
+    translator = ResponsesTranslator(_response())
+    translator.feed("messages/partial", [{"id": "m1", "type": "ai", "content": ""}])
+    translator.feed(
+        "values",
+        {
+            "messages": [
+                {
+                    "id": "m1",
+                    "type": "ai",
+                    "content": "Hello",
+                    "tool_calls": [{"id": "call-1", "name": "search", "args": {}}],
+                }
+            ]
+        },
+    )
+    finished = translator.feed("end", {"status": "success"})
+    output = finished[0]["response"]["output"]
+
+    assert output[0]["status"] == "completed"
+    assert output[0]["content"][0]["text"] == "Hello"
+    assert output[1]["type"] == "function_call"
+    assert output[1]["name"] == "search"
+
+
+def test_native_message_events_become_text_deltas() -> None:
+    """Agent Protocol v2 message events are not dropped on this surface."""
+    translator = ResponsesTranslator(_response())
+    start = translator.feed("messages", {"event": "message-start", "role": "ai", "id": "m1"})
+    delta = translator.feed(
+        "messages",
+        {"event": "content-block-delta", "delta": {"type": "text-delta", "text": "Hi"}},
+    )
+    done = translator.feed("messages", {"event": "message-finish"})
+    finished = translator.feed("end", {"status": "success"})
+
+    assert start[0]["type"] == "response.output_item.added"
+    assert delta[-1]["type"] == "response.output_text.delta"
+    assert delta[-1]["delta"] == "Hi"
+    assert done[0]["type"] == "response.output_text.done"
+    assert finished[0]["response"]["output"][0]["content"][0]["text"] == "Hi"
+
+
+def _run(status: str) -> Run:
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 1, 2, tzinfo=UTC)
+    return Run(
+        run_id="run-1",
+        thread_id="thread-1",
+        assistant_id="assistant-1",
+        status=status,
+        user_id="test-user",
+        created_at=now,
+        updated_at=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_cursor_with_history_emits_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cursor that is not in the buffer must not swallow the rest of the stream."""
+
+    async def fake_iter(_run: Run, _last_event_id: str | None = None) -> Any:
+        yield ("run-1_event_4", "end", {"status": "success"})
+
+    monkeypatch.setattr(
+        "aegra_api.services.responses_stream.streaming_service.iter_broker_events",
+        fake_iter,
+    )
+    frames = [
+        frame
+        async for frame in iter_responses_sse(
+            _run("success"),
+            _response(),
+            starting_after="not-a-broker-id",
+        )
+    ]
+
+    assert any("starting_after is no longer available" in frame for frame in frames)
+
+
+@pytest.mark.asyncio
+async def test_evicted_cursor_resumes_from_later_sequences(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the named event aged out, later broker events are still delivered."""
+
+    async def fake_iter(_run: Run, _last_event_id: str | None = None) -> Any:
+        yield ("run-1_event_8", "end", {"status": "success"})
+
+    monkeypatch.setattr(
+        "aegra_api.services.responses_stream.streaming_service.iter_broker_events",
+        fake_iter,
+    )
+    frames = [
+        frame
+        async for frame in iter_responses_sse(
+            _run("success"),
+            _response(),
+            starting_after="run-1_event_3",
+        )
+    ]
+
+    assert any("response.completed" in frame for frame in frames)
+    assert not any("no longer available" in frame for frame in frames)
 
 
 def test_encode_uses_the_event_type_as_the_sse_name() -> None:

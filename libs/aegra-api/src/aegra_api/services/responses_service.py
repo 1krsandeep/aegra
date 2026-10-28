@@ -15,7 +15,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.api.runs import _apply_create_run_auth
-from aegra_api.api.threads import get_thread_state
+from aegra_api.api.threads import _resolve_ttl_row, get_thread_state
+from aegra_api.core.auth_filters import build_metadata_filter
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
 from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
@@ -50,6 +51,10 @@ from aegra_api.utils.assistants import resolve_assistant_id
 logger = structlog.getLogger(__name__)
 
 _RESPONSE_STREAM_MODES = ["messages", "values"]
+# Same window as run resume validation: the interrupt event is published
+# before the executor commits thread and run status.
+_INTERRUPT_SETTLE_ATTEMPTS = 10
+_INTERRUPT_SETTLE_INTERVAL_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
@@ -85,14 +90,21 @@ async def load_owned_run(session: AsyncSession, run_id: str, user_id: str) -> Ru
     )
 
 
-async def load_owned_thread(session: AsyncSession, thread_id: str, user_id: str) -> ThreadORM | None:
-    """Load a thread only when it belongs to ``user_id``."""
-    return await session.scalar(
-        select(ThreadORM).where(
-            ThreadORM.thread_id == thread_id,
-            ThreadORM.user_id == user_id,
-        )
+async def load_owned_thread(
+    session: AsyncSession,
+    thread_id: str,
+    user_id: str,
+    filters: dict[str, Any] | None = None,
+) -> ThreadORM | None:
+    """Load a thread only when it belongs to ``user_id`` and passes handler filters."""
+    stmt = select(ThreadORM).where(
+        ThreadORM.thread_id == thread_id,
+        ThreadORM.user_id == user_id,
     )
+    auth_filter = build_metadata_filter(ThreadORM.metadata_json, filters)
+    if auth_filter is not None:
+        stmt = stmt.where(auth_filter)
+    return await session.scalar(stmt)
 
 
 def project_run(run: RunORM) -> dict[str, Any]:
@@ -109,51 +121,58 @@ def project_run(run: RunORM) -> dict[str, Any]:
     )
 
 
-async def execute_response(session: AsyncSession, user: User, body: ResponseCreate) -> dict[str, Any] | StartedRun:
-    """Create a response, wait for it, or hand back a run the caller will stream."""
-    turn = prepare_turn(body)
-    resolved = await resolve_thread(session, user, body)
-    await _authorize_thread(user, resolved)
+async def execute_response(user: User, body: ResponseCreate) -> dict[str, Any] | StartedRun:
+    """Create a response, wait for it, or hand back a run the caller will stream.
 
-    pending: list[str] = []
-    if turn.interrupt_id is not None:
-        pending = await pending_interrupt_ids(session, resolved.thread_id, user.identity)
-        if turn.interrupt_id not in pending:
-            raise ResponsesError(409, f"Interrupt '{turn.interrupt_id}' is not pending")
+    Preparation uses a short-lived session. The wait happens after that session
+    closes so a synchronous response does not hold a pool connection.
+    """
+    maker = _get_session_maker()
+    async with maker() as session:
+        turn = prepare_turn(body)
+        resolved = await resolve_thread(session, user, body)
+        await _authorize_thread(user, resolved)
 
-    if turn.rejected:
-        if resolved.thread is None or resolved.thread.status != "interrupted":
-            raise HTTPException(409, "Cannot reject an approval when the conversation is not interrupted")
-        await _authorize_run(user, resolved.thread_id, body.model)
-        return await _persist_rejection(
-            session, user, body, resolved.thread, turn.reject_reason or "interrupt rejected"
+        if turn.interrupt_id is not None:
+            pending = await _await_pending_interrupts(resolved.thread_id, user.identity, turn.interrupt_id)
+        else:
+            pending = []
+
+        if turn.rejected:
+            if resolved.thread is None or resolved.thread.status != "interrupted":
+                raise HTTPException(409, "Cannot reject an approval when the conversation is not interrupted")
+            await _authorize_run(user, resolved.thread_id, body.model)
+            return await _persist_rejection(
+                session, user, body, resolved.thread, reason=turn.reject_reason or "interrupt rejected"
+            )
+
+        resume = bind_resume(turn.interrupt_id, turn.resume, pending) if turn.interrupt_id else turn.resume
+        request = _run_create(body, turn, resume=resume)
+        await _apply_create_run_auth(user, resolved.thread_id, request)
+        message_offset = 0 if resolved.minted else await _message_offset(resolved.thread_id, user)
+        meta = build_responses_meta(body, conversation_id=conversation_id_of(body.conversation))
+        meta["message_offset"] = message_offset
+        run_id, run_model, _job = await _prepare_run(
+            session,
+            resolved.thread_id,
+            request,
+            user,
+            initial_status="pending",
+            responses_meta=meta,
         )
-
-    resume = bind_resume(turn.interrupt_id, turn.resume, pending) if turn.interrupt_id else turn.resume
-    request = _run_create(body, turn, resume=resume)
-    await _apply_create_run_auth(user, resolved.thread_id, request)
-    message_offset = 0 if resolved.minted else await _message_offset(resolved.thread_id, user)
-    meta = build_responses_meta(body, conversation_id=conversation_id_of(body.conversation))
-    meta["message_offset"] = message_offset
-    run_id, run_model, _job = await _prepare_run(
-        session,
-        resolved.thread_id,
-        request,
-        user,
-        initial_status="pending",
-        responses_meta=meta,
-    )
-    orm = await load_owned_run(session, run_id, user.identity)
-    if orm is None:
-        raise HTTPException(500, f"Response '{run_id}' was not persisted")
-    payload = project_run(orm)
+        orm = await load_owned_run(session, run_id, user.identity)
+        if orm is None:
+            raise HTTPException(500, f"Response '{run_id}' was not persisted")
+        payload = project_run(orm)
+        ephemeral = resolved.ephemeral
+        thread_id = resolved.thread_id
 
     if body.stream:
         return StartedRun(
             run=run_model,
             payload=payload,
-            ephemeral=resolved.ephemeral,
-            thread_id=resolved.thread_id,
+            ephemeral=ephemeral,
+            thread_id=thread_id,
             user_id=user.identity,
             cancel_on_disconnect=not body.background,
             message_offset=message_offset,
@@ -175,8 +194,8 @@ async def execute_response(session: AsyncSession, user: User, body: ResponseCrea
             raise HTTPException(404, f"Response '{run_id}' not found")
         return project_run(fresh)
     finally:
-        if resolved.ephemeral and not _retains_run(fresh):
-            await asyncio.shield(delete_thread_by_id(resolved.thread_id, user.identity))
+        if ephemeral and not _retains_run(fresh):
+            await asyncio.shield(delete_thread_by_id(thread_id, user.identity))
 
 
 async def iter_response_sse(started: StartedRun, *, starting_after: str | None) -> AsyncGenerator[str, None]:
@@ -217,7 +236,7 @@ async def resolve_thread(session: AsyncSession, user: User, body: ResponseCreate
             minted=True,
         )
 
-    thread = await load_owned_thread(session, thread_id, user.identity)
+    thread = await _thread_visible_to(session, user, thread_id)
     if thread is None:
         if conversation_id:
             raise HTTPException(404, f"Conversation '{thread_id}' not found")
@@ -227,33 +246,30 @@ async def resolve_thread(session: AsyncSession, user: User, body: ResponseCreate
 
 async def create_conversation(session: AsyncSession, user: User, body: ConversationCreate) -> dict[str, Any]:
     """Create an empty thread and return it as a conversation."""
-    await handle_event(build_auth_context(user, "threads", "create"), body.model_dump())
+    value = body.model_dump()
+    filters = await handle_event(build_auth_context(user, "threads", "create"), value)
     now = datetime.now(UTC)
     thread_id = str(uuid4())
-    metadata = body.metadata or {}
+    metadata = _conversation_metadata(body.metadata, filters, value, owner=user.identity)
     thread = ThreadORM(
         thread_id=thread_id,
         status="idle",
-        metadata_json={
-            "owner": user.identity,
-            "assistant_id": None,
-            "graph_id": None,
-            "thread_name": "",
-            "responses_metadata": metadata,
-        },
+        metadata_json=metadata,
         user_id=user.identity,
         created_at=now,
         updated_at=now,
     )
     session.add(thread)
+    ttl_row = _resolve_ttl_row(thread_id, None)
+    if ttl_row is not None:
+        session.add(ttl_row)
     await session.commit()
-    return _conversation_body(thread_id, now, metadata)
+    return _conversation_body(thread_id, now, public_thread_metadata(metadata))
 
 
 async def read_conversation(session: AsyncSession, user: User, conversation_id: str) -> dict[str, Any]:
     """Return one conversation owned by the caller."""
-    await handle_event(build_auth_context(user, "threads", "read"), {"thread_id": conversation_id})
-    thread = await load_owned_thread(session, conversation_id, user.identity)
+    thread = await _thread_visible_to(session, user, conversation_id)
     if thread is None:
         raise HTTPException(404, f"Conversation '{conversation_id}' not found")
     return _conversation_body(thread.thread_id, thread.created_at, public_thread_metadata(thread.metadata_json))
@@ -261,8 +277,7 @@ async def read_conversation(session: AsyncSession, user: User, conversation_id: 
 
 async def list_conversation_items(session: AsyncSession, user: User, conversation_id: str) -> list[dict[str, Any]]:
     """Read thread checkpoint messages as conversation items."""
-    await handle_event(build_auth_context(user, "threads", "read"), {"thread_id": conversation_id})
-    thread = await load_owned_thread(session, conversation_id, user.identity)
+    thread = await _thread_visible_to(session, user, conversation_id)
     if thread is None:
         raise HTTPException(404, f"Conversation '{conversation_id}' not found")
     try:
@@ -294,10 +309,9 @@ async def load_assistant(session: AsyncSession, user: User, model: str) -> Assis
 
 
 async def _authorize_thread(user: User, resolved: ResolvedThread) -> None:
-    if resolved.minted:
-        await handle_event(build_auth_context(user, "threads", "create"), {"thread_id": resolved.thread_id})
+    if not resolved.minted:
         return
-    await handle_event(build_auth_context(user, "threads", "read"), {"thread_id": resolved.thread_id})
+    await handle_event(build_auth_context(user, "threads", "create"), {"thread_id": resolved.thread_id})
 
 
 async def _authorize_run(user: User, thread_id: str, assistant_id: str) -> None:
@@ -313,6 +327,7 @@ async def _persist_rejection(
     user: User,
     body: ResponseCreate,
     thread: ThreadORM,
+    *,
     reason: str,
 ) -> dict[str, Any]:
     assistant = await load_assistant(session, user, body.model)
@@ -365,6 +380,41 @@ def _run_create(body: ResponseCreate, turn: PreparedTurn, *, resume: Any) -> Run
     )
 
 
+async def _thread_visible_to(session: AsyncSession, user: User, thread_id: str) -> ThreadORM | None:
+    """Load a thread only when ``threads.read`` allows it, including metadata filters."""
+    filters = await handle_event(build_auth_context(user, "threads", "read"), {"thread_id": thread_id})
+    handler_filters = filters if isinstance(filters, dict) else None
+    return await load_owned_thread(session, thread_id, user.identity, handler_filters)
+
+
+def _conversation_metadata(
+    requested: dict[str, Any] | None,
+    filters: dict[str, Any] | None,
+    value: dict[str, Any],
+    *,
+    owner: str,
+) -> dict[str, Any]:
+    """Thread metadata, keeping handler-injected keys beside the public conversation metadata."""
+    public = {key: item for key, item in (requested or {}).items() if isinstance(key, str) and isinstance(item, str)}
+    handler_meta: dict[str, Any] = {}
+    if isinstance(filters, dict) and isinstance(filters.get("metadata"), dict):
+        handler_meta = filters["metadata"]
+    elif isinstance(value.get("metadata"), dict):
+        handler_meta = value["metadata"]
+    metadata: dict[str, Any] = {
+        "assistant_id": None,
+        "graph_id": None,
+        "thread_name": "",
+        "responses_metadata": dict(public),
+    }
+    for key, item in handler_meta.items():
+        if key in public or key == "owner":
+            continue
+        metadata[key] = item
+    metadata["owner"] = owner
+    return metadata
+
+
 def _retains_run(run: RunORM | None) -> bool:
     if run is None:
         return False
@@ -385,6 +435,25 @@ async def _message_offset(thread_id: str, user: User) -> int:
     if not isinstance(messages, list):
         return 0
     return len(messages)
+
+
+async def _await_pending_interrupts(thread_id: str, user_id: str, interrupt_id: str) -> list[str]:
+    """Read pending interrupts, retrying while the executor's commit is still in flight."""
+    pending = await _pending_on_fresh_session(thread_id, user_id)
+    if interrupt_id in pending:
+        return pending
+    for _ in range(_INTERRUPT_SETTLE_ATTEMPTS):
+        await asyncio.sleep(_INTERRUPT_SETTLE_INTERVAL_SECONDS)
+        pending = await _pending_on_fresh_session(thread_id, user_id)
+        if interrupt_id in pending:
+            return pending
+    raise ResponsesError(409, f"Interrupt '{interrupt_id}' is not pending")
+
+
+async def _pending_on_fresh_session(thread_id: str, user_id: str) -> list[str]:
+    maker = _get_session_maker()
+    async with maker() as session:
+        return await pending_interrupt_ids(session, thread_id, user_id)
 
 
 async def pending_interrupt_ids(session: AsyncSession, thread_id: str, user_id: str) -> list[str]:
