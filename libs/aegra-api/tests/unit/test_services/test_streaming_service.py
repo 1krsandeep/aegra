@@ -1,5 +1,6 @@
 """Unit tests for streaming_service module"""
 
+import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from typing import Any
@@ -8,7 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aegra_api.models import Run
-from aegra_api.services.streaming_service import StreamingService
+from aegra_api.services.broker import broker_manager
+from aegra_api.services.streaming_service import StreamingService, parse_broker_event
 
 
 @pytest.mark.asyncio
@@ -399,6 +401,89 @@ class TestStreamingService:
 
         assert events == []
         mock_manager.get_or_create_broker.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_iter_broker_events_replays_then_follows_new_events(self) -> None:
+        """Replay yields stored events, and the live tail waits only while the run is active."""
+        service = StreamingService()
+        run_id = "run-broker-coverage"
+        broker = broker_manager.get_or_create_broker(run_id)
+        try:
+            await broker.put(f"{run_id}_event_1", ("values", {"a": 1}))
+            await broker.put(f"{run_id}_event_2", ("node", "updates", {"b": 2}))
+            await broker.put(f"{run_id}_event_3", (1, 2))
+            await broker.put(f"{run_id}_event_4", {"raw": True})
+
+            run = Run(
+                run_id=run_id,
+                status="running",
+                user_id="user-1",
+                thread_id="thread-1",
+                assistant_id="agent",
+                input={"message": "hello"},
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+
+            async def publish_live() -> None:
+                await asyncio.sleep(0.01)
+                await broker.put(f"{run_id}_event_0", ("values", {"skipped": True}))
+                await broker.put(f"{run_id}_event_5", ("messages", [{"id": "m"}]))
+                await broker.put(f"{run_id}_event_7", (1, 2, 3))
+                await broker.put(f"{run_id}_event_6", ("end", {"status": "success"}))
+
+            task = asyncio.create_task(publish_live())
+            async with asyncio.timeout(2):
+                events = [event async for event in service.iter_broker_events(run, f"{run_id}_event_1")]
+            await task
+        finally:
+            broker_manager.remove_broker(run_id)
+
+        kinds = [event_type for _event_id, event_type, _payload in events]
+        assert "updates" in kinds
+        assert "messages" in kinds
+        assert "end" in kinds
+        assert parse_broker_event(("values", {"a": 1})) == ("values", {"a": 1})
+        assert parse_broker_event(("node", "updates", {"b": 2})) == ("updates", {"b": 2})
+        assert parse_broker_event((1, 2, 3)) is None
+        assert parse_broker_event({"raw": True}) == ("values", {"raw": True})
+
+    @pytest.mark.asyncio
+    async def test_live_tail_creates_a_broker_for_an_active_run(self) -> None:
+        """A run that has not published yet still gets a broker for events that arrive later."""
+        service = StreamingService()
+        run_id = "run-broker-created-live"
+        run = Run(
+            run_id=run_id,
+            status="running",
+            user_id="user-1",
+            thread_id="thread-1",
+            assistant_id="agent",
+            input={"message": "hello"},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+
+        async def publish_live() -> None:
+            broker = None
+            for _ in range(50):
+                broker = broker_manager.get_broker(run_id)
+                if broker is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert broker is not None
+            await broker.put(f"{run_id}_event_1", ("values", {"a": 1}))
+            await broker.put(f"{run_id}_event_2", ("end", {"status": "success"}))
+
+        task = asyncio.create_task(publish_live())
+        try:
+            async with asyncio.timeout(2):
+                events = [event async for event in service.iter_broker_events(run, None)]
+            await task
+        finally:
+            broker_manager.remove_broker(run_id)
+
+        assert events[-1][1] == "end"
 
     @pytest.mark.asyncio
     async def test_cleanup_run(self) -> None:

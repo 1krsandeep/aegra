@@ -1,6 +1,6 @@
 """HTTP tests for the Open Responses facade with the database and executor mocked."""
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -414,3 +414,48 @@ def test_read_conversation_applies_the_handler_filter(monkeypatch: pytest.Monkey
     assert response.status_code == 404
     compiled = str(session.statements[-1].compile(dialect=postgresql.dialect()))
     assert "metadata_json @>" in compiled
+
+
+def test_starting_after_without_stream_is_an_openai_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """starting_after on a JSON read is a Responses error, not an Agent Protocol body."""
+    client, _session, _calls = _client(monkeypatch, _run())
+
+    response = client.get("/v1/responses/run-1", params={"starting_after": "run-1_event_1"})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_cancel_missing_response_is_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancel of an unknown response is an OpenAI 404."""
+    client, _session, _calls = _client(monkeypatch, None)
+
+    response = client.post("/v1/responses/missing/cancel")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["message"] == "Response 'missing' not found"
+
+
+def test_get_stream_reattaches_with_the_stored_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET stream=true reattaches SSE and only keeps a positive integer message offset."""
+
+    async def fake_iter(
+        _run: Run,
+        _response: dict[str, Any],
+        *,
+        starting_after: str | None,
+        message_offset: int = 0,
+    ) -> AsyncIterator[str]:
+        del starting_after
+        yield f"event: response.completed\ndata: {message_offset}\n\n"
+
+    monkeypatch.setattr("aegra_api.api.responses.iter_responses_sse", fake_iter)
+    stored = _run()
+    stored.execution_params["responses_meta"]["message_offset"] = 3
+    client, _session, _calls = _client(monkeypatch, stored)
+
+    response = client.get("/v1/responses/run-1", params={"stream": "true"})
+
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    assert "data: 3" in response.text

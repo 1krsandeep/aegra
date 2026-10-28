@@ -279,6 +279,146 @@ async def test_finished_response_without_a_broker_snapshots() -> None:
     assert any("Hi" in frame for frame in frames)
 
 
+def test_closed_translator_ignores_later_events() -> None:
+    """A terminal event closes the translator, including a non-object end payload."""
+    translator = ResponsesTranslator(_response())
+    assert translator.feed("debug", {"ignored": True}) == []
+    translator.feed("end", "done")
+    assert translator.feed("messages/partial", [{"id": "m1", "type": "ai", "content": "Hi"}]) == []
+
+
+def test_error_and_failed_snapshot_use_the_stored_message() -> None:
+    """Broker errors and a failed snapshot both become response.failed."""
+    translator = ResponsesTranslator(_response())
+    failed = translator.feed("error", {"message": "boom"})
+    assert failed[0]["type"] == "response.failed"
+    assert failed[0]["response"]["error"]["message"] == "boom"
+
+    bare = ResponsesTranslator(_response())
+    bare.feed("error", None)
+    assert bare.response["error"]["message"] == "execution failed"
+
+    stored = _response()
+    stored["status"] = "failed"
+    stored["error"] = {"message": "saved"}
+    snapshot = ResponsesTranslator(stored).snapshot_events()
+    assert snapshot[-1]["type"] == "response.failed"
+    assert snapshot[-1]["response"]["error"]["message"] == "saved"
+
+    unnamed = _response()
+    unnamed["status"] = "failed"
+    unnamed["error"] = "not-an-object"
+    assert ResponsesTranslator(unnamed).snapshot_events()[-1]["response"]["error"]["message"] == "Run failed"
+
+
+def test_incomplete_snapshot_and_duplicate_interrupts() -> None:
+    """An incomplete snapshot stays incomplete, and the same interrupt is emitted once."""
+    stored = _response()
+    stored["status"] = "incomplete"
+    snapshot = ResponsesTranslator(stored).snapshot_events()
+    assert snapshot[-1]["type"] == "response.incomplete"
+
+    translator = ResponsesTranslator(_response())
+    payload = {"__interrupt__": [{"id": "int-1", "value": {"name": "search"}}]}
+    first = translator.feed("values", payload)
+    second = translator.feed("values|inner", payload)
+    assert first[0]["item"]["name"] == "search"
+    assert second == []
+    assert translator.feed("values", ["not-a-dict"]) == []
+
+
+def test_non_assistant_and_replaced_text_are_handled() -> None:
+    """User messages are skipped, and a non-prefix snapshot replaces the accumulated text."""
+    translator = ResponsesTranslator(_response())
+    assert translator.feed("messages/partial", [{"type": "human", "content": "Hi"}]) == []
+    assert translator.feed("messages/partial", None) == []
+    opened = translator.feed("messages/partial", {"id": "m1", "type": "ai", "content": "Hi"})
+    assert opened[-1]["delta"] == "Hi"
+    replaced = translator.feed("messages/partial", {"id": "m1", "type": "ai", "content": "Yo"})
+    assert replaced[-1]["delta"] == "Yo"
+
+
+def test_native_message_shapes_that_do_not_open_an_item() -> None:
+    """Finish, unknown events, and wrapped protocol payloads stay aligned with the active item."""
+    translator = ResponsesTranslator(_response())
+    assert translator.feed("messages", "nope") == []
+    assert translator.feed("messages", {"event": "message-finish"}) == []
+    assert translator.feed("messages", {"event": "content-block-start"}) == []
+    wrapped = translator.feed(
+        "messages",
+        {"params": {"data": {"event": "message-start", "id": "m9", "role": "assistant"}}},
+    )
+    assert wrapped[0]["type"] == "response.output_item.added"
+    assert translator.feed("messages", {"params": "nope"}) == []
+
+
+def test_end_error_reconciles_tool_calls_from_final_values() -> None:
+    """A failed end closes the response, and a successful end keeps tool calls from values."""
+    translator = ResponsesTranslator(_response())
+    assert translator.feed("end", {"status": "error"})[0]["type"] == "response.failed"
+
+    with_tools = ResponsesTranslator(_response())
+    with_tools.feed("messages/partial", [{"id": "m1", "type": "ai", "content": "Hi"}])
+    with_tools.feed(
+        "values",
+        {
+            "messages": [
+                {
+                    "id": "m1",
+                    "type": "ai",
+                    "content": "Hi",
+                    "tool_calls": [{"name": "search", "id": "call-1", "args": {"q": "x"}}],
+                }
+            ]
+        },
+    )
+    done = with_tools.feed("end", {"status": "success"})
+    output = done[0]["response"]["output"]
+    assert any(item.get("type") == "function_call" for item in output)
+
+    replaced = ResponsesTranslator(_response())
+    replaced.feed("messages/partial", [{"id": "m1", "type": "ai", "content": "Hi"}])
+    replaced._output_items[0]["status"] = "completed"
+    replaced._output_items[0]["content"] = "not-a-list"
+    replaced.feed("values", {"messages": [{"id": "m1", "type": "ai", "content": "Hi there"}]})
+    finished = replaced.feed("end", {"status": "success"})
+    assert finished[0]["response"]["output"][0]["content"][0]["text"] == "Hi there"
+
+
+@pytest.mark.asyncio
+async def test_exact_cursor_and_missing_history_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An exact cursor skips that event, and a terminal run with no history returns the snapshot."""
+
+    async def fake_iter(_run: Run, _last_event_id: str | None = None) -> Any:
+        yield ("run-1_event_2", "end", {"status": "success"})
+
+    monkeypatch.setattr(
+        "aegra_api.services.responses_stream.streaming_service.iter_broker_events",
+        fake_iter,
+    )
+    frames = [frame async for frame in iter_responses_sse(_run("success"), _response(), starting_after="run-1_event_2")]
+    assert frames == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_run_without_history_snapshots_after_a_cursor() -> None:
+    """A cursor on a finished run with no broker falls back to the saved response."""
+    empty_run = _run("success")
+    empty_run.run_id = "run-snapshot-cursor"
+    saved = _response()
+    saved["status"] = "completed"
+    async with asyncio.timeout(2):
+        snapshot = [
+            frame
+            async for frame in iter_responses_sse(
+                empty_run,
+                saved,
+                starting_after="run-snapshot-cursor_event_1",
+            )
+        ]
+    assert any("response.completed" in frame for frame in snapshot)
+
+
 def test_encode_uses_the_event_type_as_the_sse_name() -> None:
     """Clients dispatch on the SSE event name, which matches the payload type."""
     frame = encode_responses_event({"type": "response.output_text.delta", "delta": "Hi"}, "run-1_event_2")
