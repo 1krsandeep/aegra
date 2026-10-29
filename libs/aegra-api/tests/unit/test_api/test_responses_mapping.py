@@ -180,6 +180,13 @@ def test_conversation_id_accepts_a_string_or_object() -> None:
         conversation_id_of({"name": "missing"})
 
 
+def test_omitted_store_keeps_the_response() -> None:
+    """The OpenAI SDK omits store, and that call must remain available for a later turn."""
+    body = _create()
+    assert body.store is True
+    assert is_ephemeral(store=body.store, conversation_id=None, previous_response_id=None) is False
+
+
 def test_ephemeral_and_thread_conflict_helpers() -> None:
     """Stateless unstored calls are ephemeral, and mismatched ids conflict."""
     assert is_ephemeral(store=False, conversation_id=None, previous_response_id=None) is True

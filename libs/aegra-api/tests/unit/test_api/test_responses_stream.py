@@ -1,12 +1,16 @@
 """Unit tests for translating broker events into Responses SSE."""
 
 import asyncio
+import json
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from aegra_api.models import Run
+from aegra_api.services.redis_broker import RedisRunBroker
 from aegra_api.services.responses_stream import ResponsesTranslator, encode_responses_event, iter_responses_sse
 
 
@@ -417,6 +421,168 @@ async def test_terminal_run_without_history_snapshots_after_a_cursor() -> None:
             )
         ]
     assert any("response.completed" in frame for frame in snapshot)
+
+
+def _cached_event(event_id: str, payload: list[Any]) -> str:
+    return json.dumps({"event_id": event_id, "payload": payload})
+
+
+class _RemoteRedisBroker(RedisRunBroker):
+    """Redis handle with no local history. Replay reads the shared list."""
+
+    def __init__(self, run_id: str, live: list[tuple[str, Any]] | None = None) -> None:
+        super().__init__(run_id, f"chan:{run_id}", f"cache:{run_id}", f"counter:{run_id}")
+        self._live = live
+        self.live_entered = False
+
+    async def aiter(self) -> AsyncIterator[tuple[str, Any]]:
+        self.live_entered = True
+        if self.is_finished():
+            return
+        if self._live is None:
+            await asyncio.Event().wait()
+            return
+        for event in self._live:
+            yield event
+
+
+class _EmptyProcessCache:
+    """Another server: nothing is cached until replay opens a handle."""
+
+    def __init__(self, broker: RedisRunBroker) -> None:
+        self._broker = broker
+        self.created = False
+
+    def get_broker(self, _run_id: str) -> RedisRunBroker | None:
+        if not self.created:
+            return None
+        return self._broker
+
+    def get_or_create_broker(self, _run_id: str) -> RedisRunBroker:
+        self.created = True
+        return self._broker
+
+
+def _resume_run(run_id: str, status: str) -> Run:
+    run = _run(status)
+    run.run_id = run_id
+    return run
+
+
+def _stored_snapshot(run_id: str) -> dict[str, Any]:
+    saved = _response()
+    saved["id"] = run_id
+    saved["status"] = "completed"
+    saved["output"] = [
+        {
+            "id": "m1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "SNAPSHOT-ONLY", "annotations": []}],
+        }
+    ]
+    return saved
+
+
+async def _frames_from_remote_redis(
+    run: Run,
+    cached: list[str],
+    *,
+    broker: _RemoteRedisBroker,
+    starting_after: str,
+) -> tuple[list[str], _EmptyProcessCache, AsyncMock]:
+    cache = _EmptyProcessCache(broker)
+    client = AsyncMock()
+    client.lrange.return_value = cached
+    with (
+        patch("aegra_api.services.streaming_service.broker_manager", cache),
+        patch("aegra_api.services.redis_broker.redis_manager") as redis,
+    ):
+        redis.get_client.return_value = client
+        async with asyncio.timeout(2):
+            frames = [
+                frame
+                async for frame in iter_responses_sse(
+                    run,
+                    _stored_snapshot(run.run_id),
+                    starting_after=starting_after,
+                )
+            ]
+    return frames, cache, client
+
+
+@pytest.mark.asyncio
+async def test_starting_after_replays_redis_history_from_another_server() -> None:
+    """A finished run resumed on a server that never executed it still yields events after the cursor."""
+    run_id = "run-remote-resume"
+    broker = _RemoteRedisBroker(run_id)
+    frames, cache, client = await _frames_from_remote_redis(
+        _resume_run(run_id, "success"),
+        [
+            _cached_event(f"{run_id}_event_1", ["messages/partial", [{"id": "m1", "type": "ai", "content": "Hel"}]]),
+            _cached_event(f"{run_id}_event_2", ["messages/partial", [{"id": "m1", "type": "ai", "content": "Hello"}]]),
+            _cached_event(f"{run_id}_event_3", ["end", {"status": "success"}]),
+        ],
+        broker=broker,
+        starting_after=f"{run_id}_event_1",
+    )
+
+    assert cache.created is True
+    assert client.lrange.await_args.args[0] == f"cache:{run_id}"
+    assert broker.live_entered is False
+    assert any('"delta":"lo"' in frame for frame in frames)
+    assert any("response.completed" in frame for frame in frames)
+    assert not any("response.created" in frame for frame in frames)
+    assert not any("SNAPSHOT-ONLY" in frame for frame in frames)
+    assert not any('"delta":"Hel"' in frame for frame in frames)
+
+
+@pytest.mark.asyncio
+async def test_starting_after_keeps_redis_events_published_before_this_server_subscribed() -> None:
+    """An active run on another server replays saved events, then follows the live tail."""
+    run_id = "run-remote-live"
+    broker = _RemoteRedisBroker(
+        run_id,
+        live=[(f"{run_id}_event_3", ("end", {"status": "success"}))],
+    )
+    frames, cache, client = await _frames_from_remote_redis(
+        _resume_run(run_id, "running"),
+        [
+            _cached_event(f"{run_id}_event_1", ["messages/partial", [{"id": "m1", "type": "ai", "content": "Hel"}]]),
+            _cached_event(f"{run_id}_event_2", ["messages/partial", [{"id": "m1", "type": "ai", "content": "Hello"}]]),
+        ],
+        broker=broker,
+        starting_after=f"{run_id}_event_1",
+    )
+
+    assert cache.created is True
+    assert client.lrange.await_args.args[0] == f"cache:{run_id}"
+    assert broker.live_entered is True
+    assert any('"delta":"lo"' in frame for frame in frames)
+    assert any("response.completed" in frame for frame in frames)
+    assert not any("SNAPSHOT-ONLY" in frame for frame in frames)
+
+
+@pytest.mark.asyncio
+async def test_starting_after_snapshots_when_the_redis_buffer_is_gone() -> None:
+    """A finished run with an expired shared buffer returns the stored output and does not wait."""
+    run_id = "run-remote-expired"
+    broker = _RemoteRedisBroker(run_id)
+    frames, cache, client = await _frames_from_remote_redis(
+        _resume_run(run_id, "success"),
+        [],
+        broker=broker,
+        starting_after=f"{run_id}_event_1",
+    )
+
+    assert cache.created is True
+    assert client.lrange.await_args.args[0] == f"cache:{run_id}"
+    assert broker.live_entered is False
+    assert broker.is_finished() is True
+    assert any("response.created" in frame for frame in frames)
+    assert any("SNAPSHOT-ONLY" in frame for frame in frames)
+    assert not any("no longer available" in frame for frame in frames)
 
 
 def test_encode_uses_the_event_type_as_the_sse_name() -> None:

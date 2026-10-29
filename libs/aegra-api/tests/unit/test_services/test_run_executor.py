@@ -221,6 +221,27 @@ class TestStreamNativeV2InterruptDetection:
         assert await self._run(("values", event)) is True
 
     @pytest.mark.asyncio
+    async def test_empty_params_interrupts_keep_nested_ids(self) -> None:
+        """An empty params.interrupts list must not hide ids nested on the payload."""
+        result = _GraphResult()
+        event = {
+            "params": {
+                "data": {"__interrupt__": [{"id": "i1", "value": 1}]},
+                "interrupts": [],
+            }
+        }
+        with (
+            patch.object(run_executor_module, "stream_native_v3_events", _v3_stream(("updates", event))),
+            patch.object(run_executor_module, "broker_manager") as bm,
+            patch.object(run_executor_module, "streaming_service") as ss,
+        ):
+            bm.allocate_event_id = AsyncMock(return_value="run-1_event_1")
+            ss.put_to_broker = AsyncMock()
+            await _stream_native_v2(_make_job(), MagicMock(), {"msg": "x"}, {}, result)
+
+        assert result.persisted_output()["__interrupt__"] == [{"id": "i1", "value": 1}]
+
+    @pytest.mark.asyncio
     async def test_interrupt_via_updates_dunder_interrupt(self) -> None:
         # The path session.py routes to input.requested but the executor missed.
         event = {"params": {"data": {"__interrupt__": [{"id": "i1", "value": 1}]}}}

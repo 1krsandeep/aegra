@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import structlog
@@ -109,6 +109,32 @@ async def load_owned_thread(
     return await session.scalar(stmt)
 
 
+async def load_visible_response(
+    session: AsyncSession,
+    user: User,
+    response_id: str,
+    *,
+    action: Literal["read", "update"],
+) -> RunORM | None:
+    """Load an owned run, then its thread under the handler filters for ``action``."""
+    run = await load_owned_run(session, response_id, user.identity)
+    if run is None:
+        return None
+    filters = await handle_event(
+        build_auth_context(user, "threads", action),
+        {"thread_id": run.thread_id},
+    )
+    thread = await load_owned_thread(
+        session,
+        run.thread_id,
+        user.identity,
+        filters if isinstance(filters, dict) else None,
+    )
+    if thread is None:
+        return None
+    return run
+
+
 def project_run(run: RunORM) -> dict[str, Any]:
     """Project a run row into a Response object."""
     output = run.output if isinstance(run.output, dict) else None
@@ -141,6 +167,8 @@ async def execute_response(user: User, body: ResponseCreate) -> dict[str, Any] |
             pending = []
 
         if turn.rejected:
+            if resolved.thread is not None:
+                await session.refresh(resolved.thread)
             if resolved.thread is None or resolved.thread.status != "interrupted":
                 raise HTTPException(409, "Cannot reject an approval when the conversation is not interrupted")
             await _authorize_run(user, resolved.thread_id, body.model)
@@ -150,7 +178,7 @@ async def execute_response(user: User, body: ResponseCreate) -> dict[str, Any] |
 
         resume = bind_resume(turn.interrupt_id, turn.resume, pending) if turn.interrupt_id else turn.resume
         request = _run_create(body, turn, resume=resume)
-        await _apply_create_run_auth(user, resolved.thread_id, request)
+        await _apply_create_run_auth(user, resolved.thread_id, request, session)
         message_offset = 0 if resolved.minted else await _message_offset(resolved.thread_id, user)
         meta = build_responses_meta(body, conversation_id=conversation_id_of(body.conversation))
         meta["message_offset"] = message_offset
@@ -505,10 +533,8 @@ def _interrupt_ids_from_output(output: Any) -> list[str]:
 
 
 async def _interrupt_ids_from_broker(run_id: str) -> list[str]:
-    """Interrupt ids already streamed for a run whose row is not committed yet."""
-    broker = broker_manager.get_broker(run_id)
-    if broker is None:
-        return []
+    """Interrupt ids streamed for this run, including another instance's Redis history."""
+    broker = broker_manager.get_or_create_broker(run_id)
     found: list[str] = []
     for _event_id, raw_event in await broker.replay(None):
         parsed = parse_broker_event(raw_event)

@@ -6,6 +6,7 @@ from typing import Any
 
 import structlog
 
+from aegra_api.core.active_runs import active_runs
 from aegra_api.core.sse import create_error_event
 from aegra_api.models import Run
 from aegra_api.services.broker import broker_manager
@@ -13,6 +14,9 @@ from aegra_api.services.event_converter import EventConverter
 from aegra_api.utils import extract_event_sequence
 
 logger = structlog.getLogger(__name__)
+
+# Runs in these states will not publish again once the local producer is gone.
+_TERMINAL_RUN_STATUSES = frozenset({"success", "error", "interrupted", "timeout"})
 
 
 class StreamingService:
@@ -211,9 +215,8 @@ class StreamingService:
         Same replay and dedup rules as ``stream_run_execution``. Callers that
         need the whole buffer for cursor state pass ``last_event_id=None``.
         """
-        run_id = run.run_id
         last_sent_sequence = extract_event_sequence(last_event_id) if last_event_id else 0
-        async for event_id, event_type, payload in self._replay_raw_events(run_id, last_event_id):
+        async for event_id, event_type, payload in self._replay_raw_events(run, last_event_id):
             replayed = extract_event_sequence(event_id)
             if replayed > last_sent_sequence:
                 last_sent_sequence = replayed
@@ -224,24 +227,27 @@ class StreamingService:
 
     async def _replay_raw_events(
         self,
-        run_id: str,
+        run: Run,
         last_event_id: str | None,
     ) -> AsyncIterator[tuple[str, str, Any]]:
-        # Creating a broker here leaves an unfinished queue. A finished run whose
-        # buffer was already evicted then blocks in the live iterator forever.
-        broker = broker_manager.get_broker(run_id)
-        if broker is None:
-            return
-        for event_id, raw_event in await broker.replay(last_event_id):
-            parsed = parse_broker_event(raw_event)
-            if parsed is not None:
+        # Redis keeps the replay list after this process drops its local broker.
+        broker = broker_manager.get_or_create_broker(run.run_id)
+        try:
+            for event_id, raw_event in await broker.replay(last_event_id):
+                parsed = parse_broker_event(raw_event)
+                if parsed is None:
+                    continue
                 event_type, payload = parsed
                 yield event_id, event_type, payload
+        finally:
+            # No local executor left to publish, so the live tail must not wait.
+            if run.status in _TERMINAL_RUN_STATUSES and run.run_id not in active_runs:
+                broker.mark_finished()
 
     async def _live_raw_events(self, run: Run, last_sent_sequence: int) -> AsyncIterator[tuple[str, str, Any]]:
         run_id = run.run_id
         broker = broker_manager.get_broker(run_id)
-        if run.status in ("success", "error", "interrupted", "timeout") and (broker is None or broker.is_finished()):
+        if run.status in _TERMINAL_RUN_STATUSES and (broker is None or broker.is_finished()):
             return
         if broker is None:
             broker = broker_manager.get_or_create_broker(run_id)

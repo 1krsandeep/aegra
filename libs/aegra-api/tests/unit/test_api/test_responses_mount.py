@@ -1,11 +1,29 @@
 """The Open Responses router is mounted only when http.responses is true."""
 
+import json
+from pathlib import Path
+from typing import Any
+
 import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 
 from aegra_api.config import responses_enabled
 from aegra_api.main import _include_core_routers, create_app
+
+
+def _responses_flag(name: str) -> bool:
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / name
+        if not candidate.is_file():
+            continue
+        loaded: Any = json.loads(candidate.read_text())
+        http = loaded.get("http") if isinstance(loaded, dict) else None
+        flag = http.get("responses") if isinstance(http, dict) else None
+        if isinstance(flag, bool):
+            return flag
+        raise AssertionError(f"{name} http.responses must be a boolean")
+    raise AssertionError(f"{name} not found")
 
 
 def _paths(app: FastAPI) -> set[str]:
@@ -24,6 +42,12 @@ def _paths(app: FastAPI) -> set[str]:
 
     walk(list(app.routes))
     return found
+
+
+def test_repository_default_leaves_responses_opt_in() -> None:
+    """The README server uses aegra.json. E2E opts in through a separate file."""
+    assert responses_enabled({"responses": _responses_flag("aegra.json")}) is False
+    assert responses_enabled({"responses": _responses_flag("aegra.responses.json")}) is True
 
 
 def test_responses_enabled_requires_boolean_true() -> None:

@@ -97,7 +97,7 @@ class ResponseCreate(BaseModel):
     previous_response_id: str | None = None
     stream: bool = False
     background: bool = False
-    store: bool = False
+    store: bool = True
     metadata: dict[str, Any] | None = None
     user: str | None = None
     tools: list[Any] | None = None

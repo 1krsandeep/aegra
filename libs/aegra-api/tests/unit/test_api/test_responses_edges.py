@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -24,6 +26,7 @@ from aegra_api.models.responses import (
 )
 from aegra_api.models.responses import _validate_metadata as validate_metadata
 from aegra_api.services.broker import broker_manager
+from aegra_api.services.redis_broker import RedisRunBroker
 from aegra_api.services.responses_mapping import (
     _as_mapping,
     _function_call_item,
@@ -94,6 +97,9 @@ class _Session:
         self.added.append(obj)
 
     async def commit(self) -> None:
+        return None
+
+    async def refresh(self, _obj: Any) -> None:
         return None
 
 
@@ -441,6 +447,51 @@ async def test_rejected_approval_is_stored_without_resuming(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
+async def test_rejection_sees_the_thread_status_committed_during_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """approve=false waits out the interrupt commit, then reads the refreshed status."""
+    row = SimpleNamespace(
+        thread_id="thread-1",
+        status="busy",
+        run_id="run-prev",
+        output={"__interrupt__": [{"id": "int-1", "value": "wait"}]},
+        assistant_id="asst",
+        graph_id="agent",
+        user_id="user-1",
+        created_at=_now(),
+        updated_at=_now(),
+        execution_params={},
+        error_message=None,
+        input=None,
+        config={},
+        context={},
+    )
+
+    class _Refreshing(_Session):
+        async def refresh(self, obj: Any) -> None:
+            obj.status = "interrupted"
+
+    class _Graphs:
+        def list_graphs(self) -> dict[str, str]:
+            return {}
+
+    async def pending(*_args: Any) -> list[str]:
+        return ["int-1"]
+
+    monkeypatch.setattr("aegra_api.services.responses_service.get_langgraph_service", lambda: _Graphs())
+    monkeypatch.setattr("aegra_api.services.responses_service._await_pending_interrupts", pending)
+    monkeypatch.setattr("aegra_api.services.responses_service._get_session_maker", lambda: lambda: _Refreshing(row))
+    body = _create(
+        conversation="thread-1",
+        input=[{"type": "mcp_approval_response", "approve": False, "approval_request_id": "int-1"}],
+    )
+    result = await execute_response(_user(), body)
+    assert isinstance(result, dict)
+    assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_wait_timeout_and_missing_reload(monkeypatch: pytest.MonkeyPatch) -> None:
     """A wait that expires becomes a failed response, and a vanished run is 404."""
     finished = SimpleNamespace(
@@ -677,7 +728,10 @@ async def test_pending_interrupts_read_the_row_and_ignore_unrelated_broker_event
     assert _interrupt_ids_from_output(None) == []
     assert _interrupt_ids_from_output({"__interrupt__": "nope"}) == []
     assert await pending_interrupt_ids(_Session(None), "thread-1", "user-1") == []
-    assert await _interrupt_ids_from_broker("run-absent") == []
+    try:
+        assert await _interrupt_ids_from_broker("run-absent") == []
+    finally:
+        broker_manager.remove_broker("run-absent")
 
     run_id = "run-broker-ids"
     broker = broker_manager.get_or_create_broker(run_id)
@@ -696,6 +750,41 @@ async def test_pending_interrupts_read_the_row_and_ignore_unrelated_broker_event
         assert await pending_interrupt_ids(_Session(empty), "thread-1", "user-1") == ["int-9"]
     finally:
         broker_manager.remove_broker(run_id)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_ids_from_broker_reads_redis_when_the_run_is_not_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An approval check on this instance reads interrupt events stored by another."""
+    run_id = "run-remote-interrupt"
+    remote = RedisRunBroker(run_id, f"chan:{run_id}", f"cache:{run_id}", f"counter:{run_id}")
+    seen: list[str] = []
+
+    def get_or_create(requested: str) -> RedisRunBroker:
+        seen.append(requested)
+        return remote
+
+    monkeypatch.setattr(
+        "aegra_api.services.responses_service.broker_manager.get_or_create_broker",
+        get_or_create,
+    )
+    client = AsyncMock()
+    client.lrange.return_value = [
+        json.dumps({"event_id": f"{run_id}_event_1", "payload": ["messages", [{"id": "m"}]]}),
+        json.dumps(
+            {
+                "event_id": f"{run_id}_event_2",
+                "payload": ["values", {"__interrupt__": [{"id": "int-remote"}]}],
+            }
+        ),
+    ]
+    with patch("aegra_api.services.redis_broker.redis_manager") as redis:
+        redis.get_client.return_value = client
+        assert await _interrupt_ids_from_broker(run_id) == ["int-remote"]
+
+    assert seen == [run_id]
+    assert client.lrange.await_args.args[0] == f"cache:{run_id}"
 
 
 @pytest.mark.asyncio

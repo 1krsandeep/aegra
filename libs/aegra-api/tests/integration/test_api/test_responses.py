@@ -83,7 +83,6 @@ def _install_auth_spy(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 
     for target in (
         "aegra_api.services.responses_service.handle_event",
-        "aegra_api.api.responses.handle_event",
         "aegra_api.api.runs.handle_event",
         "aegra_api.api.threads.handle_event",
     ):
@@ -171,6 +170,40 @@ def test_sync_response_returns_assistant_text_and_authorizes_the_run(
     assert ("assistants", "read") in calls
 
 
+def test_omitted_store_keeps_the_response_for_a_later_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    prepared_run: None,
+) -> None:
+    """A create that leaves store unset is kept, so previous_response_id can chain."""
+    del prepared_run
+    finished = _run()
+    monkeypatch.setattr(
+        "aegra_api.services.responses_service._get_session_maker",
+        lambda: lambda: ScalarSession(finished),
+    )
+    deleted: list[str] = []
+
+    async def fake_delete(_thread_id: str, user_id: str) -> None:
+        deleted.append(user_id)
+
+    async def empty_state(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(values={"messages": []})
+
+    monkeypatch.setattr("aegra_api.services.responses_service.delete_thread_by_id", fake_delete)
+    monkeypatch.setattr("aegra_api.services.responses_service.get_thread_state", empty_state)
+    client, _session, _calls = _client(monkeypatch, finished)
+
+    first = client.post("/v1/responses", json={"model": "agent", "input": "Hi"})
+    assert first.status_code == 200, first.text
+    assert deleted == []
+
+    follow_up = client.post(
+        "/v1/responses",
+        json={"model": "agent", "input": "Continue", "previous_response_id": first.json()["id"]},
+    )
+    assert follow_up.status_code == 200, follow_up.text
+
+
 def test_background_response_returns_without_waiting(
     monkeypatch: pytest.MonkeyPatch,
     prepared_run: None,
@@ -234,12 +267,39 @@ def test_get_response_is_scoped_to_the_caller(monkeypatch: pytest.MonkeyPatch) -
     assert missing.json()["error"]["code"] == "not_found"
     compiled = str(session.statements[0].compile(dialect=postgresql.dialect()))
     assert "user_id" in compiled
-    assert ("threads", "read") in calls
+    assert ("threads", "read") not in calls
 
-    found_client, _found_session, _found_calls = _client(monkeypatch, _run())
+    found_client, _found_session, found_calls = _client(monkeypatch, _run())
     found = found_client.get("/v1/responses/run-1")
     assert found.status_code == 200
     assert found.json()["output"][0]["content"][0]["text"] == "Hello"
+    assert ("threads", "read") in found_calls
+
+
+def test_get_and_cancel_authorize_the_thread_not_the_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Thread handlers see thread_id, and their metadata filter is part of the thread lookup."""
+    seen: list[dict[str, Any]] = []
+
+    async def spy(ctx: Any, value: dict[str, Any]) -> dict[str, str] | None:
+        seen.append(dict(value))
+        if ctx.resource == "threads" and ctx.action in ("read", "update"):
+            return {"metadata": {"team_id": "team-1"}}
+        return None
+
+    client, session, _calls = _client(monkeypatch, _run())
+    monkeypatch.setattr("aegra_api.services.responses_service.handle_event", spy)
+    monkeypatch.setattr("aegra_api.api.responses._request_run_interruption", AsyncMock())
+
+    fetched = client.get("/v1/responses/run-1")
+    assert fetched.status_code == 200, fetched.text
+    cancelled = client.post("/v1/responses/run-1/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+
+    assert seen == [{"thread_id": "thread-1"}, {"thread_id": "thread-1"}]
+    assert all("run_id" not in value for value in seen)
+    thread_sql = [str(stmt.compile(dialect=postgresql.dialect())) for stmt in session.statements[1::2]]
+    assert thread_sql
+    assert all("thread_id" in sql and "metadata_json @>" in sql for sql in thread_sql)
 
 
 def test_cancel_projects_a_cancelled_response(monkeypatch: pytest.MonkeyPatch) -> None:

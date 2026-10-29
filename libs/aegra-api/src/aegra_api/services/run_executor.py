@@ -279,9 +279,10 @@ async def _stream_native_v2(
         # Interrupts ride on values.params.interrupts, or as an __interrupt__ key
         # in a values/updates payload (the path session.py routes to input.requested).
         raw_interrupts = params.get("interrupts")
-        if not isinstance(raw_interrupts, list) and isinstance(data, dict):
+        if not raw_interrupts and isinstance(data, dict):
             nested = data.get("__interrupt__")
-            raw_interrupts = nested if isinstance(nested, list) else None
+            if isinstance(nested, list):
+                raw_interrupts = nested
         if raw_interrupts or (isinstance(data, dict) and "__interrupt__" in data):
             result.has_interrupt = True
             if isinstance(raw_interrupts, list):

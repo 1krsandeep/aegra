@@ -1,7 +1,7 @@
 """E2E coverage for the optional Open Responses surface.
 
-Requires a running server whose aegra.json sets ``http.responses`` to true
-and deploys the ``agent`` graph.
+Requires a running server whose config sets ``http.responses`` to true
+(``aegra.responses.json`` in CI and ``make e2e-*``) and deploys the ``agent`` graph.
 """
 
 import pytest

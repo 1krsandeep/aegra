@@ -22,7 +22,6 @@ from starlette.responses import Response
 from aegra_api.api.runs import _request_run_interruption
 from aegra_api.api.threads import delete_thread
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
-from aegra_api.core.auth_handlers import build_auth_context, handle_event
 from aegra_api.core.orm import get_session
 from aegra_api.core.sse import get_sse_headers, make_sse_response, sse_to_bytes
 from aegra_api.models import Run, User
@@ -45,7 +44,7 @@ from aegra_api.services.responses_service import (
     execute_response,
     iter_response_sse,
     list_conversation_items,
-    load_owned_run,
+    load_visible_response,
     project_run,
     read_conversation,
 )
@@ -160,8 +159,7 @@ async def get_response(
     """Read a response, or reattach to its stream. Mounted only when http.responses is true."""
     if starting_after is not None and not stream:
         raise ResponsesError(422, "starting_after requires stream=true")
-    await handle_event(build_auth_context(user, "threads", "read"), {"run_id": response_id})
-    run = await load_owned_run(session, response_id, user.identity)
+    run = await load_visible_response(session, user, response_id, action="read")
     if run is None:
         raise HTTPException(404, f"Response '{response_id}' not found")
     payload = project_run(run)
@@ -194,8 +192,7 @@ async def cancel_response(
     session: AsyncSession = Depends(get_session),
 ) -> ResponseResource:
     """Cancel an in-progress response. Mounted only when http.responses is true."""
-    await handle_event(build_auth_context(user, "threads", "update"), {"run_id": response_id})
-    run = await load_owned_run(session, response_id, user.identity)
+    run = await load_visible_response(session, user, response_id, action="update")
     if run is None:
         raise HTTPException(404, f"Response '{response_id}' not found")
     await _request_run_interruption(session, run, "cancel")

@@ -5359,7 +5359,7 @@
           "store": {
             "type": "boolean",
             "title": "Store",
-            "default": false
+            "default": true
           },
           "metadata": {
             "anyOf": [

@@ -1,16 +1,87 @@
 """Unit tests for streaming_service module"""
 
 import asyncio
-from collections.abc import AsyncGenerator
+import contextlib
+import json
+from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from aegra_api.core.active_runs import active_runs
 from aegra_api.models import Run
-from aegra_api.services.broker import broker_manager
+from aegra_api.services.broker import RunBroker, broker_manager
+from aegra_api.services.redis_broker import RedisRunBroker
 from aegra_api.services.streaming_service import StreamingService, parse_broker_event
+
+
+def _run(run_id: str, status: str) -> Run:
+    now = datetime.now(UTC)
+    return Run(
+        run_id=run_id,
+        status=status,
+        user_id="user-1",
+        thread_id="thread-1",
+        assistant_id="agent",
+        input={"message": "hello"},
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _cached(event_id: str, payload: list[Any]) -> str:
+    return json.dumps({"event_id": event_id, "payload": payload})
+
+
+class _RemoteRedisBroker(RedisRunBroker):
+    """Redis broker whose live tail is scripted. Replay still reads the Redis list."""
+
+    def __init__(self, run_id: str, live: list[tuple[str, Any]] | None = None) -> None:
+        super().__init__(run_id, f"chan:{run_id}", f"cache:{run_id}", f"counter:{run_id}")
+        self._live = live
+        self.live_entered = False
+
+    async def aiter(self) -> AsyncIterator[tuple[str, Any]]:
+        self.live_entered = True
+        if self.is_finished():
+            return
+        if self._live is None:
+            await asyncio.Event().wait()
+            return
+        for event in self._live:
+            yield event
+
+
+class _SignalingBroker(RunBroker):
+    """In-memory broker that records when a consumer enters the live tail."""
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(run_id)
+        self.live_started = asyncio.Event()
+
+    async def aiter(self) -> AsyncIterator[tuple[str, Any]]:
+        self.live_started.set()
+        async for event in super().aiter():
+            yield event
+
+
+class _EmptyLocalCache:
+    """Starts with no local broker, then keeps the one replay creates."""
+
+    def __init__(self, broker: RedisRunBroker) -> None:
+        self._broker = broker
+        self._visible = False
+
+    def get_broker(self, _run_id: str) -> RedisRunBroker | None:
+        if not self._visible:
+            return None
+        return self._broker
+
+    def get_or_create_broker(self, _run_id: str) -> RedisRunBroker:
+        self._visible = True
+        return self._broker
 
 
 @pytest.mark.asyncio
@@ -381,26 +452,128 @@ class TestStreamingService:
             assert service.is_run_streaming("run-1") is False
 
     @pytest.mark.asyncio
-    async def test_terminal_run_without_a_broker_does_not_wait(self) -> None:
-        """Replay must not create an empty broker, or a finished run hangs waiting for events."""
+    async def test_terminal_run_with_an_expired_redis_buffer_does_not_wait(self) -> None:
+        """A finished run whose Redis list is gone returns immediately instead of tailing live."""
         service = StreamingService()
-        run = Run(
-            run_id="run-finished",
-            status="success",
-            user_id="user-1",
-            thread_id="thread-1",
-            assistant_id="agent",
-            input={"message": "hello"},
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
-        )
+        run_id = "run-redis-expired"
+        broker = _RemoteRedisBroker(run_id)
+        client = AsyncMock()
+        client.lrange.return_value = []
 
-        with patch("aegra_api.services.streaming_service.broker_manager") as mock_manager:
-            mock_manager.get_broker.return_value = None
-            events = [event async for event in service.iter_broker_events(run, None)]
+        with (
+            patch("aegra_api.services.streaming_service.broker_manager", _EmptyLocalCache(broker)),
+            patch("aegra_api.services.redis_broker.redis_manager") as redis,
+        ):
+            redis.get_client.return_value = client
+            async with asyncio.timeout(1):
+                events = [event async for event in service.iter_broker_events(_run(run_id, "success"), None)]
 
         assert events == []
-        mock_manager.get_or_create_broker.assert_not_called()
+        assert broker.is_finished() is True
+        assert broker.live_entered is False
+        assert client.lrange.await_args.args[0] == f"cache:{run_id}"
+
+    @pytest.mark.asyncio
+    async def test_terminal_run_replays_redis_history_without_a_local_broker(self) -> None:
+        """A finished run streamed from another instance replays the Redis list and then stops."""
+        service = StreamingService()
+        run_id = "run-redis-done"
+        broker = _RemoteRedisBroker(run_id)
+        client = AsyncMock()
+        client.lrange.return_value = [
+            _cached(f"{run_id}_event_1", ["values", {"a": 1}]),
+            _cached(f"{run_id}_event_2", ["end", {"status": "success"}]),
+        ]
+
+        with (
+            patch("aegra_api.services.streaming_service.broker_manager", _EmptyLocalCache(broker)),
+            patch("aegra_api.services.redis_broker.redis_manager") as redis,
+        ):
+            redis.get_client.return_value = client
+            async with asyncio.timeout(1):
+                events = [event async for event in service.iter_broker_events(_run(run_id, "success"), None)]
+
+        assert events == [
+            (f"{run_id}_event_1", "values", {"a": 1}),
+            (f"{run_id}_event_2", "end", {"status": "success"}),
+        ]
+        assert broker.is_finished() is True
+        assert broker.live_entered is False
+
+    @pytest.mark.asyncio
+    async def test_active_run_replays_redis_history_without_a_local_broker(self) -> None:
+        """An active run on another instance replays Redis history and then follows live events."""
+        service = StreamingService()
+        run_id = "run-redis-live"
+        broker = _RemoteRedisBroker(
+            run_id,
+            live=[
+                (f"{run_id}_event_2", ("messages", [{"id": "m"}])),
+                (f"{run_id}_event_3", ("end", {"status": "success"})),
+            ],
+        )
+        client = AsyncMock()
+        client.lrange.return_value = [_cached(f"{run_id}_event_1", ["values", {"a": 1}])]
+
+        with (
+            patch("aegra_api.services.streaming_service.broker_manager", _EmptyLocalCache(broker)),
+            patch("aegra_api.services.redis_broker.redis_manager") as redis,
+        ):
+            redis.get_client.return_value = client
+            async with asyncio.timeout(1):
+                events = [event async for event in service.iter_broker_events(_run(run_id, "running"), None)]
+
+        assert [(event_id, event_type) for event_id, event_type, _payload in events] == [
+            (f"{run_id}_event_1", "values"),
+            (f"{run_id}_event_2", "messages"),
+            (f"{run_id}_event_3", "end"),
+        ]
+        assert broker.is_finished() is False
+        assert broker.live_entered is True
+
+    @pytest.mark.asyncio
+    async def test_terminal_replay_waits_while_the_local_producer_is_still_running(self) -> None:
+        """A finished row can commit before the end event; the live tail waits for that publish."""
+        service = StreamingService()
+        run_id = "run-producer-open"
+        broker = _SignalingBroker(run_id)
+        producer = asyncio.create_task(asyncio.sleep(3600))
+        active_runs[run_id] = producer
+
+        async def collect() -> list[tuple[str, str, Any]]:
+            async with asyncio.timeout(2):
+                return [event async for event in service.iter_broker_events(_run(run_id, "success"), None)]
+
+        stream: asyncio.Task[list[tuple[str, str, Any]]] | None = None
+        try:
+            await broker.put(f"{run_id}_event_1", ("values", {"a": 1}))
+            with (
+                patch("aegra_api.services.streaming_service.broker_manager.get_broker", return_value=broker),
+                patch(
+                    "aegra_api.services.streaming_service.broker_manager.get_or_create_broker",
+                    return_value=broker,
+                ),
+            ):
+                stream = asyncio.create_task(collect())
+                async with asyncio.timeout(1):
+                    await broker.live_started.wait()
+                await broker.put(f"{run_id}_event_2", ("end", {"status": "success"}))
+                events = await stream
+        finally:
+            if stream is not None and not stream.done():
+                stream.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stream
+            producer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await producer
+            active_runs.pop(run_id, None)
+            broker_manager.remove_broker(run_id)
+
+        assert [(event_id, event_type) for event_id, event_type, _payload in events] == [
+            (f"{run_id}_event_1", "values"),
+            (f"{run_id}_event_2", "end"),
+        ]
 
     @pytest.mark.asyncio
     async def test_iter_broker_events_replays_then_follows_new_events(self) -> None:
@@ -435,14 +608,16 @@ class TestStreamingService:
             task = asyncio.create_task(publish_live())
             async with asyncio.timeout(2):
                 events = [event async for event in service.iter_broker_events(run, f"{run_id}_event_1")]
-            await task
+            assert await task is None
         finally:
             broker_manager.remove_broker(run_id)
 
-        kinds = [event_type for _event_id, event_type, _payload in events]
-        assert "updates" in kinds
-        assert "messages" in kinds
-        assert "end" in kinds
+        assert [(event_id, event_type) for event_id, event_type, _payload in events] == [
+            (f"{run_id}_event_2", "updates"),
+            (f"{run_id}_event_4", "values"),
+            (f"{run_id}_event_5", "messages"),
+            (f"{run_id}_event_6", "end"),
+        ]
         assert parse_broker_event(("values", {"a": 1})) == ("values", {"a": 1})
         assert parse_broker_event(("node", "updates", {"b": 2})) == ("updates", {"b": 2})
         assert parse_broker_event((1, 2, 3)) is None
@@ -479,7 +654,7 @@ class TestStreamingService:
         try:
             async with asyncio.timeout(2):
                 events = [event async for event in service.iter_broker_events(run, None)]
-            await task
+            assert await task is None
         finally:
             broker_manager.remove_broker(run_id)
 
